@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.wrangler/
+
+# build info
+*.tsbuildinfo
+
+# stray compiled artifacts (dist/ is the only build output)
+*.js.map
+*.d.ts.map
+
+# root-level config build artifacts
+/playwright.config.js
+/playwright.config.d.ts
+/vitest.config.js
+/vitest.config.d.ts
+
+# e2e build artifacts
+/e2e/*.js
+/e2e/*.d.ts
+
+# CLI binary output
+/bin/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+.DS_Store

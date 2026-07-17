@@ -1,0 +1,23 @@
+{
+  "name": "opencode-github-observer",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "vitest run",
+    "test:unit": "vitest run --project shared --project worker",
+    "test:integration": "vitest run --project worker",
+    "test:e2e": "npm run build && npx playwright test",
+    "typecheck": "npm run build",
+    "lint": "npm run build && echo 'Type check passed'"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.1",
+    "wrangler": "^4.24.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

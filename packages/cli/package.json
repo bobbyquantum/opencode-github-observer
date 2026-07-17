@@ -1,0 +1,25 @@
+{
+  "name": "@opencode-observer/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "opencode-observer": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "bundle": "bun build src/index.ts --outfile ../../bin/opencode-observer.js --target bun",
+    "build:bin": "npm run bundle && printf '#!/bin/sh\\nDIR=\"$(cd \"$(dirname \"$(readlink -f \"$0\")\")\" && pwd)\"\\nexec node \"$DIR/opencode-observer.js\" \"$@\"\\n' > ../../bin/opencode-observer && chmod +x ../../bin/opencode-observer && echo '{\"type\":\"module\"}' > ../../bin/package.json",
+    "build:all": "npm run build && npm run build:bin"
+  },
+  "dependencies": {
+    "@opencode-observer/shared": "*",
+    "@opencode-observer/daemon": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.0",
+    "typescript": "^5.8.3"
+  }
+}

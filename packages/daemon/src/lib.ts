@@ -1,0 +1,10 @@
+export { Daemon } from "./daemon.js";
+export { WebSocketClient } from "./ws-client.js";
+export { SessionManager } from "./session-manager.js";
+export { SessionMap } from "./session-map.js";
+export type { SessionRecord, LookupKey } from "./session-map.js";
+export { EventWatcher, handleEvent } from "./event-watcher.js";
+export { OpencodeServerManager } from "./server-manager.js";
+export { OpencodeClient } from "./opencode/client.js";
+export { detectStalls, buildDirectoryHints } from "./stall-detector.js";
+export type { StallConfig, StallFinding, StallDetectionResult } from "./stall-detector.js";

@@ -1,0 +1,21 @@
+name = "opencode-github-observer"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+
+# Route the Worker on the custom domain. quantum.observer must be a zone in
+# your Cloudflare account for this to deploy.
+routes = [
+  { pattern = "github.quantum.observer/*", zone_name = "quantum.observer" }
+]
+
+[durable_objects]
+bindings = [
+  { name = "WEBSOCKET_HUB", class_name = "WebSocketHub" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketHub"]
+
+[vars]
+GITHUB_CLIENT_ID = "Ov23litWeKp11Cxe5oWQ"
