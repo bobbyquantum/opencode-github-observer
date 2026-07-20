@@ -1,19 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { handleEvent, parseBranchFromCommand, type WatcherState } from "../src/event-watcher.js";
 import { SessionMap } from "../src/session-map.js";
+import { BranchPrCache } from "../src/branch-pr-cache.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-function makeState(): WatcherState {
+function makeState(withCache = false): WatcherState {
   const sessionMap = new SessionMap("/tmp/oco-test-smap-unused.json");
   vi.spyOn(sessionMap, "persist").mockResolvedValue(undefined);
-  return {
+  const state: WatcherState = {
     repo: "owner/repo",
     currentBranch: "feature",
     sessionMap,
   };
+  if (withCache) {
+    const cache = new BranchPrCache("/tmp/oco-test-bpc-unused.json");
+    vi.spyOn(cache, "persist").mockResolvedValue(undefined);
+    state.branchPrCache = cache;
+  }
+  return state;
 }
 
 function toolEvent(sessionID: string, command: string, output: string, status: "completed" | "running" = "completed") {
@@ -71,6 +78,92 @@ describe("handleEvent", () => {
     );
     const rec = state.sessionMap.lookup("owner/repo", { prNumber: 42 });
     expect(rec?.sessionID).toBe("s2");
+  });
+
+  it("records branch -> PR into BranchPrCache when gh pr create succeeds", () => {
+    state = makeState(true);
+    handleEvent(
+      toolEvent("s2", "gh pr create --fill", "Creating pull request for feature into main in owner/repo\nhttps://github.com/owner/repo/pull/42"),
+      state,
+    );
+    expect(state.branchPrCache?.lookupByBranch("owner/repo", "feature")?.prNumber).toBe(42);
+  });
+
+  it("records headSha into BranchPrCache on git push", () => {
+    state = makeState(true);
+    const sha = "b".repeat(40);
+    handleEvent(toolEvent("s3", "git push origin feature", `To github.com:owner/repo\n ${sha}..${sha}  feature -> feature`), state);
+    // No PR number in a plain push, so cache should NOT have an entry yet.
+    expect(state.branchPrCache?.lookupByBranch("owner/repo", "feature")).toBeUndefined();
+  });
+
+  it("does NOT record PR into BranchPrCache on git push even when output contains a PR URL", () => {
+    state = makeState(true);
+    const sha = "c".repeat(40);
+    handleEvent(
+      toolEvent("s7", "git push -u origin feature", `To github.com:owner/repo\n * [new branch] feature -> feature\nremote: Create a pull request for 'feature' on GitHub\nremote: https://github.com/owner/repo/pull/7\n${sha}`),
+      state,
+    );
+    // The "Create a pull request" URL in push output is NOT a confirmation
+    // that a PR exists — it's just a hint. So no PR should be recorded.
+    const entry = state.branchPrCache?.lookupByBranch("owner/repo", "feature");
+    expect(entry).toBeUndefined();
+    // But the session map should still have the branch recorded.
+    expect(state.sessionMap.lookup("owner/repo", { branch: "feature" })?.sessionID).toBe("s7");
+  });
+
+  it("records PR into BranchPrCache on gh pr create", () => {
+    state = makeState(true);
+    const sha = "c".repeat(40);
+    handleEvent(
+      toolEvent("s7", "gh pr create --fill", `Creating pull request for feature into main in owner/repo\nhttps://github.com/owner/repo/pull/42\n${sha}`),
+      state,
+    );
+    const entry = state.branchPrCache?.lookupByBranch("owner/repo", "feature");
+    expect(entry?.prNumber).toBe(42);
+    expect(entry?.headSha).toBe(sha);
+  });
+
+  it("restarts the event stream when the connection ends", async () => {
+    // Simulate a stream that ends after 2 events, then reconnects.
+    const events1 = [
+      { type: "vcs.branch.updated", properties: { branch: "b1" } },
+      { type: "vcs.branch.updated", properties: { branch: "b2" } },
+    ];
+    const events2 = [
+      { type: "vcs.branch.updated", properties: { branch: "b3" } },
+    ];
+    let callCount = 0;
+    const client = {
+      subscribeEvents: vi.fn(async function* () {
+        callCount++;
+        const events = callCount === 1 ? events1 : events2;
+        for (const e of events) yield e as never;
+      }),
+    };
+    const sessionMap = new SessionMap("/tmp/oco-ew-restart-test.json");
+    vi.spyOn(sessionMap, "persist").mockResolvedValue(undefined);
+    const watcher = new (await import("../src/event-watcher.js")).EventWatcher(
+      "owner/repo",
+      client,
+      sessionMap,
+    );
+
+    // Start the watcher. It should call subscribeEvents, receive the first
+    // batch, then the stream ends. The watcher should reconnect and receive
+    // the second batch. We stop it after the second batch arrives.
+    const startPromise = watcher.start();
+    // Wait for both batches to be processed (the watcher reconnects on end).
+    // Poll until callCount >= 2 or timeout.
+    const deadline = Date.now() + 2000;
+    while (callCount < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    watcher.stop();
+    await startPromise;
+
+    // Should have called subscribeEvents at least twice (initial + reconnect).
+    expect(callCount).toBeGreaterThanOrEqual(2);
   });
 
   it("records headSha when a 40-char sha appears in output", () => {

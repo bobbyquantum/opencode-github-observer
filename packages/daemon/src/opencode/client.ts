@@ -12,6 +12,12 @@ export type OpencodeClientOptions = {
   baseUrl: string;
   password?: string;
   username?: string;
+  // Worktree directory the opencode server should scope session queries to.
+  // Sent as `X-Opencode-Directory` header on every request. The opencode server
+  // resolves this to a project ID and returns sessions for that project across
+  // all its worktrees (e.g. /data/inkweld returns sessions in merry-gopher,
+  // disco-badger, lunar-aardvark, vivid-toucan worktrees too).
+  directory?: string;
   fetch?: typeof fetch;
   signal?: AbortSignal;
 };
@@ -31,6 +37,9 @@ export class OpencodeClient {
         ? globalThis.btoa(`${user}:${opts.password}`)
         : Buffer.from(`${user}:${opts.password}`).toString("base64");
       this.headers["Authorization"] = `Basic ${token}`;
+    }
+    if (opts.directory) {
+      this.headers["X-Opencode-Directory"] = opts.directory;
     }
   }
 
@@ -117,6 +126,19 @@ export class OpencodeClient {
       signal: signal ?? undefined,
     });
     if (!res.ok) throw new Error(`vcsInfo failed: ${res.status}`);
+    return (await res.json()) as VcsInfo;
+  }
+
+  // Queries VCS info for a specific worktree directory, overriding the
+  // client's default directory header for this one call. Used by the session
+  // manager to find which session's worktree is on the event's branch.
+  async vcsInfoForDirectory(directory: string, signal?: AbortSignal): Promise<VcsInfo> {
+    const headers = { ...this.headers, "X-Opencode-Directory": directory };
+    const res = await this.fetchFn(`${this.baseUrl}/vcs`, {
+      headers,
+      signal: signal ?? undefined,
+    });
+    if (!res.ok) throw new Error(`vcsInfoForDirectory failed: ${res.status}`);
     return (await res.json()) as VcsInfo;
   }
 

@@ -1,11 +1,13 @@
 import type { Event, ToolPart } from "./opencode/types.js";
 import type { SessionMap } from "./session-map.js";
+import type { BranchPrCache } from "./branch-pr-cache.js";
 import { logger } from "./logger.js";
 
 export type WatcherState = {
   repo: string;
   currentBranch: string;
   sessionMap: SessionMap;
+  branchPrCache?: BranchPrCache;
 };
 
 const SHA_RE = /\b[0-9a-f]{40}\b/;
@@ -62,7 +64,12 @@ export function handleEvent(event: Event, state: WatcherState): string | undefin
           return undefined;
         }
         const headSha = output.match(SHA_RE)?.[0];
-        const prNumberMatch = output.match(PR_URL_RE);
+        // Only extract a PR number from `gh pr create` output. GitHub's
+        // `git push` response sometimes includes a "Create a pull request
+        // for '<branch>' on GitHub" URL in the remote output, which would
+        // falsely match a PR URL regex even though no PR exists yet.
+        const isPrCreate = /\bgh pr create\b/.test(command);
+        const prNumberMatch = isPrCreate ? output.match(PR_URL_RE) : null;
         const prNumber = prNumberMatch ? parseInt(prNumberMatch[1], 10) : undefined;
 
         state.sessionMap.record({
@@ -74,6 +81,14 @@ export function handleEvent(event: Event, state: WatcherState): string | undefin
           updatedAt: new Date().toISOString(),
         });
         void state.sessionMap.persist();
+
+        // Also record into the branch-pr cache so future CI-failure events
+        // on this branch/sha resolve to the PR without hitting the GitHub API.
+        if (state.branchPrCache && prNumber !== undefined) {
+          state.branchPrCache.record(state.repo, branch, prNumber, headSha);
+          void state.branchPrCache.persist();
+        }
+
         logger.info(`[${state.repo}] recorded session ${part.sessionID} -> branch ${branch}`, {
           headSha,
           prNumber,
@@ -89,37 +104,70 @@ export function handleEvent(event: Event, state: WatcherState): string | undefin
 
 export class EventWatcher {
   private abort: AbortController | null = null;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private restartResolve: (() => void) | null = null;
+  private running = false;
 
   constructor(
     private repo: string,
     private client: { subscribeEvents: (signal?: AbortSignal) => AsyncGenerator<Event, void, unknown> },
     private sessionMap: SessionMap,
+    private branchPrCache?: BranchPrCache,
   ) {}
 
+  // Starts the event stream. Reconnects automatically on stream end or error
+  // (opencode server restarts, network blips, etc.) with exponential backoff.
   async start(): Promise<void> {
-    this.abort = new AbortController();
-    const state: WatcherState = {
-      repo: this.repo,
-      currentBranch: "",
-      sessionMap: this.sessionMap,
-    };
+    this.running = true;
+    let attempt = 0;
+    while (this.running) {
+      this.abort = new AbortController();
+      const state: WatcherState = {
+        repo: this.repo,
+        currentBranch: "",
+        sessionMap: this.sessionMap,
+        ...(this.branchPrCache ? { branchPrCache: this.branchPrCache } : {}),
+      };
 
-    // Don't let the watcher crash the daemon if the stream errors; reconnect
-    // is handled by the caller re-starting if desired.
-    try {
-      for await (const event of this.client.subscribeEvents(this.abort.signal)) {
-        const next = handleEvent(event, state);
-        if (next !== undefined) state.currentBranch = next;
+      try {
+        for await (const event of this.client.subscribeEvents(this.abort.signal)) {
+          const next = handleEvent(event, state);
+          if (next !== undefined) state.currentBranch = next;
+        }
+        // Stream ended cleanly (e.g. server restarted). Log and reconnect.
+        if (this.running) {
+          logger.info(`[${this.repo}] event stream ended; reconnecting`);
+        }
+      } catch (err) {
+        if (!this.abort.signal.aborted) {
+          logger.warn(`[${this.repo}] event stream error`, err);
+        }
       }
-    } catch (err) {
-      if (!this.abort.signal.aborted) {
-        logger.warn(`[${this.repo}] event stream ended`, err);
-      }
+
+      if (!this.running) break;
+      // Backoff: 1s, 2s, 4s, ... capped at 30s. Reset on successful stream.
+      const delay = Math.min(1000 * Math.pow(2, attempt), 30_000);
+      attempt++;
+      await new Promise<void>((resolve) => {
+        this.restartResolve = resolve;
+        this.restartTimer = setTimeout(resolve, delay);
+      });
+      this.restartTimer = null;
+      this.restartResolve = null;
     }
   }
 
   stop(): void {
+    this.running = false;
     this.abort?.abort();
     this.abort = null;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    // Resolve any pending backoff promise so start() exits promptly instead
+    // of hanging on the sleep timer.
+    this.restartResolve?.();
+    this.restartResolve = null;
   }
 }

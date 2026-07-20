@@ -1,14 +1,17 @@
 import { WebSocketClient } from "./ws-client.js";
 import { SessionManager } from "./session-manager.js";
 import { SessionMap } from "./session-map.js";
+import { BranchPrCache } from "./branch-pr-cache.js";
 import { OpencodeServerManager } from "./server-manager.js";
 import { EventWatcher } from "./event-watcher.js";
 import { detectStalls, buildDirectoryHints, type StallConfig } from "./stall-detector.js";
+import { findFailingPrs, DEFAULT_WATCHDOG_CONFIG, type WatchdogConfig } from "./watchdog.js";
 import { loadConfig, loadToken } from "./config.js";
 import { logger, setLogLevel } from "./logger.js";
 import type { ServerMessage } from "@opencode-observer/shared";
 
 const STALL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000; // every hour
 
 export class Daemon {
   private client: WebSocketClient | null = null;
@@ -16,7 +19,9 @@ export class Daemon {
   private serverManager: OpencodeServerManager | null = null;
   private watchers: EventWatcher[] = [];
   private sessionMap: SessionMap | null = null;
+  private branchPrCache: BranchPrCache | null = null;
   private stallTimer: ReturnType<typeof setInterval> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private config: import("@opencode-observer/shared").ObserverConfig | null = null;
   private running = false;
   private shutdownBound: (() => Promise<void>) | null = null;
@@ -44,6 +49,11 @@ export class Daemon {
     this.sessionMap = new SessionMap();
     await this.sessionMap.load();
 
+    // Persistent branch -> PR cache so CI-failure events (which carry no PR
+    // number in the GitHub check_run payload) can be enriched instantly.
+    this.branchPrCache = new BranchPrCache();
+    await this.branchPrCache.load();
+
     // Ensures an opencode server is running per watched repo working directory.
     this.serverManager = new OpencodeServerManager(config.opencodeCommand);
 
@@ -52,7 +62,7 @@ export class Daemon {
     for (const [repo, repoConfig] of Object.entries(config.repos)) {
       try {
         const server = await this.serverManager.ensure(repoConfig.workdir, repoConfig.serverUrl, repoConfig.serverPassword);
-        const watcher = new EventWatcher(repo, server.client, this.sessionMap);
+        const watcher = new EventWatcher(repo, server.client, this.sessionMap, this.branchPrCache ?? undefined);
         this.watchers.push(watcher);
         // Fire-and-forget; the watcher runs until stopped.
         watcher.start().catch((err) => logger.warn(`Watcher for ${repo} stopped`, err));
@@ -65,6 +75,8 @@ export class Daemon {
       repos: config.repos,
       serverManager: this.serverManager,
       sessionMap: this.sessionMap,
+      ...(this.branchPrCache ? { branchPrCache: this.branchPrCache } : {}),
+      ...(token ? { githubToken: token } : {}),
     });
 
     // Start periodic stall detection. Scans opencode sessions for bash tools
@@ -75,6 +87,12 @@ export class Daemon {
       abort: true,
     };
     this.startStallDetection(stallConfig);
+
+    // Start the watchdog: hourly scan of open PRs for CI failures; re-prompts
+    // idle sessions that have a fresh session mapping. Catches cases where a
+    // webhook was missed or a session went idle before fully fixing the issue.
+    const watchdogConfig: WatchdogConfig = { ...DEFAULT_WATCHDOG_CONFIG };
+    this.startWatchdog(watchdogConfig, token);
 
     this.client = new WebSocketClient(
       config.serverUrl,
@@ -147,11 +165,59 @@ export class Daemon {
     this.stallTimer = setInterval(run, STALL_CHECK_INTERVAL_MS);
   }
 
+  private startWatchdog(config: WatchdogConfig, token: string): void {
+    const run = async () => {
+      if (!this.sessions || !this.branchPrCache || !token) return;
+      for (const [repo, _repoConfig] of Object.entries(this.config?.repos ?? {})) {
+        try {
+          const result = await findFailingPrs(repo, token, this.branchPrCache!, config);
+          // Log every run so we can confirm the watchdog is alive (even when
+          // there's nothing to do — shows "watchdog: 0 failing, 0 unmapped").
+          logger.info(`[${repo}] watchdog: ${result.failingPrs.length} failing PRs with sessions, ${result.unmappedPrs.length} unmapped failing PRs`);
+
+          // Re-prompt idle sessions for failing PRs that have a session mapping.
+          for (const pr of result.failingPrs) {
+            const outcome = await this.sessions!.repromptIfIdle(
+              repo,
+              pr.prNumber,
+              pr.branch,
+              pr.headSha,
+              pr.failNames,
+              config.idleThresholdMs,
+            );
+            if (outcome === "prompted") {
+              logger.info(`[${repo}] watchdog: re-prompted #${pr.prNumber} (failures: ${pr.failNames.join(", ")})`);
+            }
+          }
+
+          // Log unmapped failing PRs at debug — these need an initial webhook
+          // event to create a session; the watchdog deliberately doesn't
+          // auto-create sessions to avoid spinning up work for renovate PRs etc.
+          if (result.unmappedPrs.length > 0) {
+            logger.debug(`[${repo}] watchdog: unmapped failing PRs (no session map entry):`, {
+              prs: result.unmappedPrs.map((p) => `#${p.prNumber} (${p.failNames.join(",")})`),
+            });
+          }
+        } catch (err) {
+          logger.debug(`[${repo}] watchdog run failed`, err);
+        }
+      }
+    };
+
+    // Run once after a short delay (so the daemon settles first), then hourly.
+    setTimeout(run, 30_000);
+    this.watchdogTimer = setInterval(run, WATCHDOG_INTERVAL_MS);
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     if (this.stallTimer) {
       clearInterval(this.stallTimer);
       this.stallTimer = null;
+    }
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
     for (const watcher of this.watchers) watcher.stop();
     this.watchers = [];

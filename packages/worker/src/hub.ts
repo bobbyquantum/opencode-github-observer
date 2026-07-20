@@ -5,12 +5,20 @@ import {
   type ActionableEvent,
 } from "@opencode-observer/shared";
 import { validateGitHubToken } from "./oauth.js";
+import { bufferEvent, drainReplayBuffer, type ReplayStorage } from "./replay.js";
 import type { Env } from "./env.js";
 
 type AuthInfo = { userId: number; login: string; repos: string[] };
 
 const PING_MSG = JSON.stringify({ kind: "ping" });
 const PONG_MSG = JSON.stringify({ kind: "pong" });
+
+// Adapter that exposes the DO storage as the simple KV interface the replay
+// helper expects.
+const doStorage = (state: DurableObjectState): ReplayStorage => ({
+  get: <T>(key: string) => state.storage.get<T>(key),
+  put: <T>(key: string, value: T) => state.storage.put(key, value),
+});
 
 export class WebSocketHub implements DurableObject {
   constructor(
@@ -87,6 +95,13 @@ export class WebSocketHub implements DurableObject {
         const ids = (await this.state.storage.get<string[]>(key)) ?? [];
         if (!ids.includes(sessionId)) ids.push(sessionId);
         await this.state.storage.put(key, ids);
+        // Replay any buffered events for this repo that haven't expired.
+        // Drains the buffer so each event is delivered at most once per client.
+        const buffered = await drainReplayBuffer(doStorage(this.state), repo);
+        for (const entry of buffered) {
+          const replayMsg = createServerMessage({ kind: "event", event: entry.event, repo });
+          try { ws.send(replayMsg); } catch {}
+        }
       }
       await this.state.storage.put(`auth:${sessionId}`, auth);
       return;
@@ -133,16 +148,29 @@ export class WebSocketHub implements DurableObject {
 
   async broadcastEvent(event: ActionableEvent, repo: string): Promise<void> {
     const ids = await this.state.storage.get<string[]>(`repo:${repo}`);
-    if (!ids || ids.length === 0) return;
+    if (!ids || ids.length === 0) {
+      // No connected subscribers — buffer for replay when a client subscribes.
+      await bufferEvent(doStorage(this.state), repo, event);
+      return;
+    }
 
+    // Deliver to live subscribers. If delivery fails on every socket (race
+    // with a disconnect), buffer the event so the next reconnect gets it.
+    // If delivery succeeds on at least one socket, don't buffer — the
+    // daemon has it; its 5-min cooldown absorbs the rare duplicate if this
+    // event was also buffered during a recent disconnect window.
     const msg = createServerMessage({ kind: "event", event, repo });
+    let delivered = false;
     for (const sessionId of ids) {
       const sockets = this.state.getWebSockets(sessionId);
       for (const ws of sockets) {
         if (ws.readyState === WebSocket.OPEN) {
-          try { ws.send(msg); } catch {}
+          try { ws.send(msg); delivered = true; } catch {}
         }
       }
+    }
+    if (!delivered) {
+      await bufferEvent(doStorage(this.state), repo, event);
     }
   }
 }

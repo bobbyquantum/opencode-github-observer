@@ -18,6 +18,11 @@ export const DEFAULT_STALL_CONFIG: StallConfig = {
   abort: true,
 };
 
+// Only scan the last N messages per session for running tools. Long-running
+// sessions with hundreds of messages would otherwise be fully re-scanned
+// every 5 minutes — a large memory/CPU hit. A stalled tool is always recent.
+const MESSAGE_SCAN_LIMIT = 50;
+
 export type StallFinding = {
   sessionID: string;
   sessionTitle: string;
@@ -55,9 +60,12 @@ export async function detectStalls(
   for (const session of candidates) {
     try {
       const messages = await client.messages(session.id);
+      // Only scan the most recent messages — a stalled tool is always recent,
+      // so we don't need to scan the full history of long-running sessions.
+      const recent = messages.slice(-MESSAGE_SCAN_LIMIT);
       const stalledTools: StallFinding["stalledTools"] = [];
 
-      for (const msg of messages) {
+      for (const msg of recent) {
         for (const part of msg.parts) {
           if (part.type !== "tool") continue;
           const toolPart = part as ToolPart;

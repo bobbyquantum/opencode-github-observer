@@ -24,7 +24,15 @@ export class OpencodeServerManager {
 
     if (serverUrl) {
       try {
-        const client = new OpencodeClient({ baseUrl: serverUrl, ...(serverPassword ? { password: serverPassword } : {}) });
+        const client = new OpencodeClient({
+          baseUrl: serverUrl,
+          // Scope all opencode API calls to the configured workdir's project.
+          // This makes listSessions return sessions across all worktrees of
+          // the project (e.g. merry-gopher, disco-badger), not just the
+          // opencode server's CWD.
+          ...(serverPassword ? { password: serverPassword } : {}),
+          ...(workdir ? { directory: workdir } : {}),
+        });
         await this.waitForHealth(client);
         const server: ManagedServer = { client, url: serverUrl };
         this.managed.set(workdir, server);
@@ -37,7 +45,7 @@ export class OpencodeServerManager {
 
     // Auto-discover a running opencode server (e.g. managed by OpenChamber)
     // by scanning running processes for "opencode serve" and extracting the port.
-    const discovered = await this.discoverRunningServer(serverPassword);
+    const discovered = await this.discoverRunningServer(workdir, serverPassword);
     if (discovered) {
       this.managed.set(workdir, discovered);
       logger.info(`Auto-discovered opencode server at ${discovered.url} for ${workdir}`);
@@ -56,7 +64,7 @@ export class OpencodeServerManager {
   // Scans running processes for "opencode serve" and extracts the port.
   // This handles the case where an external manager (e.g. OpenChamber) has
   // already started a server with a dynamic port.
-  async discoverRunningServer(password?: string): Promise<ManagedServer | null> {
+  async discoverRunningServer(workdir: string, password?: string): Promise<ManagedServer | null> {
     const { execSync } = await import("node:child_process");
     const cmd = process.platform === "win32" ? 'wmic process where "name like %opencode%" get commandline' : "ps aux";
     try {
@@ -70,7 +78,11 @@ export class OpencodeServerManager {
         const hostMatch = line.match(/--hostname\s+([\d.]+)/);
         const host = hostMatch ? hostMatch[1] : "127.0.0.1";
         const url = `http://${host}:${port}`;
-        const client = new OpencodeClient({ baseUrl: url, ...(password ? { password } : {}) });
+        const client = new OpencodeClient({
+          baseUrl: url,
+          ...(password ? { password } : {}),
+          ...(workdir ? { directory: workdir } : {}),
+        });
         try {
           await this.waitForHealth(client);
           return { client, url };
@@ -97,7 +109,10 @@ export class OpencodeServerManager {
   }
 
   private async spawnServer(workdir: string): Promise<ManagedServer> {
-    for (let attempt = 0; attempt < 20; attempt++) {
+    // Fail fast: if the opencode binary is missing or the first couple of
+    // ports fail, give up. Previously we retried 20 times, which just spun
+    // for minutes before failing anyway.
+    for (let attempt = 0; attempt < 3; attempt++) {
       const port = this.nextPort++;
       const url = `http://127.0.0.1:${port}`;
       const args = ["serve", "--port", String(port), "--hostname", "127.0.0.1"];
@@ -119,7 +134,10 @@ export class OpencodeServerManager {
         logger.debug(`[opencode:${workdir}] exited with code ${code}`);
       });
 
-      const client = new OpencodeClient({ baseUrl: url });
+      const client = new OpencodeClient({
+        baseUrl: url,
+        ...(workdir ? { directory: workdir } : {}),
+      });
       try {
         await this.waitForHealth(client);
         logger.info(`Started opencode server for ${workdir} at ${url}`);
@@ -129,7 +147,7 @@ export class OpencodeServerManager {
         try { child.kill("SIGKILL"); } catch {}
       }
     }
-    throw new Error(`Could not start opencode server for ${workdir}`);
+    throw new Error(`Could not start opencode server for ${workdir} after 3 attempts`);
   }
 
   private async waitForHealth(client: OpencodeClient): Promise<void> {

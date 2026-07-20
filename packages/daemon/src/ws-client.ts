@@ -22,6 +22,8 @@ export class WebSocketClient extends EventEmitter {
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private intentionalClose = false;
   private authed = false;
+  private lastConnectedAt: number | null = null;
+  private lastDisconnectedAt: number | null = null;
 
   constructor(
     private url: string,
@@ -94,7 +96,14 @@ export class WebSocketClient extends EventEmitter {
     });
 
     this.ws.on("close", (code: number, reason: Buffer) => {
-      logger.info(`WebSocket closed: ${code} ${reason.toString()}`);
+      const now = Date.now();
+      const blindWindowMs = this.lastConnectedAt ? now - this.lastConnectedAt : null;
+      // Log the duration since last successful connect — this is the upper
+      // bound on any blind window during which broadcast events may have been
+      // buffered by the relay DO for replay on reconnect.
+      const blindNote = blindWindowMs !== null ? ` (blind window: ${(blindWindowMs / 1000).toFixed(1)}s)` : "";
+      logger.info(`WebSocket closed: ${code} ${reason.toString()}${blindNote}`);
+      this.lastDisconnectedAt = now;
       this.authed = false;
       this.clearTimers();
       this.emit("disconnected");
@@ -112,7 +121,15 @@ export class WebSocketClient extends EventEmitter {
     switch (msg.kind) {
       case "connected":
         this.authed = true;
-        logger.info(`Authenticated, session: ${msg.sessionId}`);
+        this.lastConnectedAt = Date.now();
+        // Log the duration since last disconnect so we know how long the
+        // client was offline (and thus how much may have been buffered).
+        if (this.lastDisconnectedAt) {
+          const offlineMs = Date.now() - this.lastDisconnectedAt;
+          logger.info(`Authenticated, session: ${msg.sessionId} (offline: ${(offlineMs / 1000).toFixed(1)}s)`);
+        } else {
+          logger.info(`Authenticated, session: ${msg.sessionId}`);
+        }
         this.emit("connected", msg.sessionId);
         this.startKeepalive();
         break;

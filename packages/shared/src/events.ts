@@ -98,7 +98,7 @@ export type GitHubWebhookEvent =
   | { type: "issue_comment"; payload: GitHubIssueCommentEvent };
 
 export type ActionableEvent = {
-  type: "ci_failure" | "review_comment" | "review_changes_requested";
+  type: "ci_failure" | "review_comment" | "review_changes_requested" | "review_summary";
   repo: string;
   repoFullName: string;
   prNumber: number;
@@ -134,6 +134,56 @@ export function isReviewChangesRequested(
     event.payload.action === "submitted" &&
     event.payload.review.state === "changes_requested"
   );
+}
+
+// Automation bots that post actionable review summaries as issue comments.
+// We only act on these — human issue comments are intentionally NOT handled
+// here (a human reviewer should be replied to, not auto-fixed blindly).
+const ACTIONABLE_ISSUE_COMMENT_BOTS = new Set([
+  "sonarqubecloud[bot]",
+  "coderabbitai[bot]",
+  "sonarcloud[bot]",
+]);
+
+// Returns true for issue comments authored by an automation bot we recognise
+// AND that contain actionable content (not a clean pass / rate-limit notice).
+// CodeRabbit summary comments with a "Actionable comments posted" count > 0
+// are actionable. SonarQube "Quality Gate passed" comments are actionable
+// only when they report new issues or security hotspots.
+export function isActionableIssueCommentEvent(
+  event: GitHubWebhookEvent,
+): event is GitHubWebhookEvent & { type: "issue_comment" } {
+  if (event.type !== "issue_comment") return false;
+  if (event.payload.action !== "created") return false;
+  // Only PRs, not plain issues — the autofixer works on PR branches.
+  if (!event.payload.issue.pull_request) return false;
+  if (!ACTIONABLE_ISSUE_COMMENT_BOTS.has(event.payload.sender.login)) return false;
+  return hasActionableContent(event.payload.comment.body, event.payload.sender.login);
+}
+
+function hasActionableContent(body: string, sender: string): boolean {
+  if (sender === "sonarqubecloud[bot]" || sender === "sonarcloud[bot]") {
+    // SonarQube: actionable if there are new issues or security hotspots.
+    // The comment body contains lines like "[0 New issues]" / "[1 New issue]".
+    // Parse the count; act only when > 0.
+    const newIssuesMatch = body.match(/\[(\d+)\s+New\s+issue/i);
+    const newIssues = newIssuesMatch ? parseInt(newIssuesMatch[1], 10) : 0;
+    const hotspotsMatch = body.match(/\[(\d+)\s+Security\s+Hotspots?\]/i);
+    const hotspots = hotspotsMatch ? parseInt(hotspotsMatch[1], 10) : 0;
+    return newIssues > 0 || hotspots > 0;
+  }
+  if (sender === "coderabbitai[bot]") {
+    // CodeRabbit summary comment: actionable if it contains "Actionable
+    // comments posted: N" with N > 0. Skip rate-limit warnings and clean
+    // "no comments" summaries.
+    const actionableMatch = body.match(/Actionable\s+comments\s+posted:\s*(\d+)/i);
+    const actionable = actionableMatch ? parseInt(actionableMatch[1], 10) : 0;
+    // Also treat comments containing inline suggestions (```suggestion blocks)
+    // as actionable even if the "Actionable comments posted" line is absent.
+    const hasSuggestion = /```suggestion/.test(body);
+    return actionable > 0 || hasSuggestion;
+  }
+  return false;
 }
 
 export function toActionableEvent(event: GitHubWebhookEvent): ActionableEvent | null {
@@ -186,6 +236,27 @@ export function toActionableEvent(event: GitHubWebhookEvent): ActionableEvent | 
       baseRef: p.pull_request.base.ref,
       message: p.review.body ?? "Changes requested",
       htmlUrl: p.review.html_url,
+      sender: p.sender.login,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  if (isActionableIssueCommentEvent(event)) {
+    const p = event.payload;
+    // The issue_comment webhook payload doesn't include head sha/branch, so
+    // the session manager enriches these via the branch-pr cache + GitHub
+    // API before prompting (same path as ci_failure enrichment).
+    return {
+      type: "review_summary",
+      repo: p.repository.full_name,
+      repoFullName: p.repository.full_name,
+      prNumber: p.issue.number,
+      prTitle: p.issue.title,
+      headSha: "",
+      headRef: "",
+      baseRef: "",
+      message: p.comment.body,
+      htmlUrl: p.comment.html_url,
       sender: p.sender.login,
       timestamp: new Date().toISOString(),
     };
