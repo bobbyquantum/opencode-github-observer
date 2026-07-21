@@ -531,6 +531,35 @@ describe("SessionManager", () => {
     // A new session should have been created.
     expect(client.createSession).toHaveBeenCalled();
   });
+
+  it("resolveSessionID re-validates a cached mapping and re-searches if the session is not relevant", async () => {
+    // The session map has a stale/wrong mapping from a pre-validation bug:
+    // ses_ha_ingress (about HA Ingress) is mapped to #9999 (typescript bump).
+    // When a CI failure for #9999 arrives, the daemon should detect the
+    // mismatch, delete the mapping, and search/create a new session instead
+    // of prompting the wrong session.
+    sessionMap.record({ sessionID: "ses_ha_ingress", repo: "owner/repo", prNumber: 9999, branch: "renovate/typescript", headSha: "sha-ts", updatedAt: "t" });
+    const client: MockClient = {
+      getSession: vi.fn(async () => makeSession("ses_ha_ingress", "/r/repo")),
+      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
+      promptAsync: vi.fn(async () => {}),
+      listSessions: vi.fn(async () => []),
+      messages: vi.fn(async () => [
+        // First user message is about HA Ingress — not relevant to typescript bump.
+        { info: { id: "m1", sessionID: "ses_ha_ingress", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_ha_ingress", messageID: "m1", type: "text", text: "Please research home assistant ingress" }] },
+      ]),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    await manager.handleEvent(makeEvent({ headRef: "renovate/typescript", prNumber: 9999, headSha: "sha-ts" }));
+
+    // ses_ha_ingress should NOT have been prompted.
+    expect(client.promptAsync).not.toHaveBeenCalledWith("ses_ha_ingress", expect.anything());
+    // The mapping should have been deleted.
+    expect(sessionMap.getBySession("ses_ha_ingress")).toBeUndefined();
+    // A new session should have been created.
+    expect(client.createSession).toHaveBeenCalled();
+  });
 });
 
 describe("buildPrompt", () => {

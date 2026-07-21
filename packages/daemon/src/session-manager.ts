@@ -222,9 +222,23 @@ export class SessionManager {
     if (existing) {
       try {
         const session = await client.getSession(existing.sessionID);
-        // Refresh mapping with PR number / headSha if we now know them.
-        this.recordResolved(session, repo, event);
-        return session.id;
+        // VALIDATION: verify the mapped session is still relevant to this
+        // event. The session map can contain stale/wrong mappings from a
+        // pre-validation bug (worktrees reassigned to different branches
+        // matched the wrong sessions via /vcs). Reject and re-search if the
+        // session's first user message doesn't reference the event's
+        // branch/PR. This self-heals the session map over time.
+        const relevant = await this.sessionRelevantToEvent(client, session.id, event);
+        if (!relevant) {
+          logger.warn(`Mapped session ${existing.sessionID} for ${repo}#${event.prNumber || event.headRef} is not relevant to the event (first user message doesn't mention branch/PR); re-searching`);
+          this.deps.sessionMap.delete(existing.sessionID);
+          await this.deps.sessionMap.persist();
+          // Fall through to searchSessions.
+        } else {
+          // Refresh mapping with PR number / headSha if we now know them.
+          this.recordResolved(session, repo, event);
+          return session.id;
+        }
       } catch {
         logger.warn(`Mapped session ${existing.sessionID} no longer exists; searching`);
         this.deps.sessionMap.delete(existing.sessionID);
@@ -498,6 +512,33 @@ export class SessionManager {
       return "skipped:no-session";
     }
 
+    // VALIDATION: verify the mapped session is still relevant to this PR.
+    // The session map can contain stale/wrong mappings from a pre-validation
+    // bug (worktrees reassigned to different branches matched the wrong
+    // sessions via /vcs). Reject if the session's first user message doesn't
+    // reference the PR — the watchdog would be prompting a session that has
+    // no context about this PR.
+    const relevant = await this.sessionRelevantToEvent(client, session.id, {
+      type: "ci_failure",
+      repo,
+      repoFullName: repo,
+      prNumber,
+      prTitle: "",
+      headSha,
+      headRef: branch,
+      baseRef: "",
+      message: "",
+      htmlUrl: `https://github.com/${repo}/pull/${prNumber}`,
+      sender: "watchdog",
+      timestamp: new Date().toISOString(),
+    });
+    if (!relevant) {
+      logger.warn(`watchdog: mapped session ${mapped.sessionID} for ${repo}#${prNumber} is not relevant (first user message doesn't mention branch/PR); removing mapping`);
+      this.deps.sessionMap.delete(mapped.sessionID);
+      await this.deps.sessionMap.persist();
+      return "skipped:no-session";
+    }
+
     const idleMs = Date.now() - session.time.updated;
     if (idleMs < idleThresholdMs) {
       return "skipped:idle";
@@ -574,6 +615,30 @@ export class SessionManager {
       session = await client.getSession(mapped.sessionID);
     } catch {
       logger.warn(`watchdog: mapped session ${mapped.sessionID} no longer exists for ${repo}#${prNumber}`);
+      this.deps.sessionMap.delete(mapped.sessionID);
+      await this.deps.sessionMap.persist();
+      return "skipped:no-session";
+    }
+
+    // VALIDATION: verify the mapped session is still relevant to this PR.
+    // Same guard as repromptIfIdle — don't prompt a session that has no
+    // context about the PR (e.g. a stale mapping from the worktree-reuse bug).
+    const relevant = await this.sessionRelevantToEvent(client, session.id, {
+      type: "ci_failure",
+      repo,
+      repoFullName: repo,
+      prNumber,
+      prTitle: "",
+      headSha,
+      headRef: branch,
+      baseRef,
+      message: "",
+      htmlUrl: `https://github.com/${repo}/pull/${prNumber}`,
+      sender: "watchdog",
+      timestamp: new Date().toISOString(),
+    });
+    if (!relevant) {
+      logger.warn(`watchdog: mapped session ${mapped.sessionID} for ${repo}#${prNumber} merge conflict is not relevant; removing mapping`);
       this.deps.sessionMap.delete(mapped.sessionID);
       await this.deps.sessionMap.persist();
       return "skipped:no-session";
