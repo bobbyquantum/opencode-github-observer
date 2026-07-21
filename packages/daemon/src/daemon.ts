@@ -172,8 +172,8 @@ export class Daemon {
         try {
           const result = await findFailingPrs(repo, token, this.branchPrCache!, config);
           // Log every run so we can confirm the watchdog is alive (even when
-          // there's nothing to do — shows "watchdog: 0 failing, 0 unmapped").
-          logger.info(`[${repo}] watchdog: ${result.failingPrs.length} failing PRs with sessions, ${result.unmappedPrs.length} unmapped failing PRs`);
+          // there's nothing to do — shows "watchdog: 0 failing, 0 unmapped, 0 conflicting").
+          logger.info(`[${repo}] watchdog: ${result.failingPrs.length} failing PRs with sessions, ${result.unmappedPrs.length} unmapped failing PRs, ${result.conflictingPrs.length} conflicting PRs`);
 
           // Re-prompt idle sessions for failing PRs that have a session mapping.
           for (const pr of result.failingPrs) {
@@ -187,6 +187,22 @@ export class Daemon {
             );
             if (outcome === "prompted") {
               logger.info(`[${repo}] watchdog: re-prompted #${pr.prNumber} (failures: ${pr.failNames.join(", ")})`);
+            }
+          }
+
+          // Re-prompt idle sessions for PRs with merge conflicts — ask them
+          // to rebase on the base branch and resolve conflicts.
+          for (const pr of result.conflictingPrs) {
+            const outcome = await this.sessions!.repromptForMergeConflict(
+              repo,
+              pr.prNumber,
+              pr.branch,
+              pr.headSha,
+              pr.baseRef,
+              config.idleThresholdMs,
+            );
+            if (outcome === "prompted") {
+              logger.info(`[${repo}] watchdog: re-prompted #${pr.prNumber} for merge conflict (base: ${pr.baseRef})`);
             }
           }
 

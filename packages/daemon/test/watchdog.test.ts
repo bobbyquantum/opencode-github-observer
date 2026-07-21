@@ -6,8 +6,10 @@ import { BranchPrCache } from "../src/branch-pr-cache.js";
 import {
   fetchOpenPrs,
   fetchFailingChecks,
+  fetchPrDetail,
   findFailingPrs,
   isPrEntryFresh,
+  isPrConflicted,
   DEFAULT_WATCHDOG_CONFIG,
   type WatchdogConfig,
 } from "../src/watchdog.js";
@@ -174,5 +176,149 @@ describe("findFailingPrs", () => {
     const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
     expect(result.failingPrs).toEqual([]);
     expect(result.unmappedPrs).toEqual([]);
+    expect(result.conflictingPrs).toEqual([]);
+  });
+
+  it("reports a conflicting PR with a fresh session mapping in conflictingPrs", async () => {
+    cache.record("owner/repo", "feat", 42, "abc123");
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
+      "/pulls/42": { number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: "conflicted", base: { ref: "main" } },
+      "/commits/abc123/check-runs": { check_runs: [{ name: "Build", conclusion: "success", head_sha: "abc123" }] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(1);
+    expect(result.conflictingPrs[0].prNumber).toBe(42);
+    expect(result.conflictingPrs[0].branch).toBe("feat");
+    expect(result.conflictingPrs[0].baseRef).toBe("main");
+    // No CI failures, so no failingPrs.
+    expect(result.failingPrs).toHaveLength(0);
+    expect(result.unmappedPrs).toHaveLength(0);
+  });
+
+  it("does not add conflicted PRs without a session mapping to conflictingPrs or unmappedPrs", async () => {
+    // No cache entry for PR 99 — conflicted but unmapped. The daemon can't
+    // prompt a session that doesn't exist, so it's skipped silently (not
+    // added to unmappedPrs, which is for CI failures only). Also, the
+    // watchdog doesn't fetch PR detail for unmapped PRs (no cache entry to
+    // check against), so no /pulls/99 call is made.
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 99, head: { ref: "new", sha: "newsha" } }],
+      "/commits/newsha/check-runs": { check_runs: [] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(0);
+    expect(result.unmappedPrs).toHaveLength(0);
+  });
+
+  it("skips conflicted PRs whose cache entry is stale", async () => {
+    cache.record("owner/repo", "feat", 42, "abc123");
+    await cache.persist();
+    const { readFile, writeFile } = await import("node:fs/promises");
+    const raw = JSON.parse(await readFile(join(dir, "branch-pr.json"), "utf-8"));
+    raw["owner/repo"]["feat"].updatedAt = "2020-01-01T00:00:00Z";
+    await writeFile(join(dir, "branch-pr.json"), JSON.stringify(raw));
+    await cache.load();
+
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
+      "/pulls/42": { number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: "conflicted", base: { ref: "main" } },
+      "/commits/abc123/check-runs": { check_runs: [] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(0);
+  });
+
+  it("skips PRs that are behind but not conflicted", async () => {
+    // "behind" means the base has moved ahead but there are no conflicts —
+    // a rebase would be nice but isn't required. Only "conflicted" is actionable.
+    cache.record("owner/repo", "feat", 42, "abc123");
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
+      "/pulls/42": { number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: "behind", base: { ref: "main" } },
+      "/commits/abc123/check-runs": { check_runs: [] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(0);
+  });
+
+  it("a PR can be both conflicted and failing CI", async () => {
+    // A PR with a merge conflict AND failing checks should appear in both
+    // conflictingPrs and failingPrs so the session gets both prompts.
+    cache.record("owner/repo", "feat", 42, "abc123");
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
+      "/pulls/42": { number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: "conflicted", base: { ref: "main" } },
+      "/commits/abc123/check-runs": { check_runs: [{ name: "Lint", conclusion: "failure", head_sha: "abc123" }] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(1);
+    expect(result.failingPrs).toHaveLength(1);
+  });
+
+  it("retries fetchPrDetail when the first call returns 'unknown'", async () => {
+    // GitHub returns "unknown" on the first call while it computes
+    // mergeability asynchronously. The watchdog should retry once.
+    cache.record("owner/repo", "feat", 42, "abc123");
+    let detailCallCount = 0;
+    const fetchFn = vi.fn(async (url: string | URL) => {
+      const path = typeof url === "string" ? url : url.toString();
+      if (path.includes("/pulls?state=open")) {
+        return new Response(JSON.stringify([{ number: 42, head: { ref: "feat", sha: "abc123" } }]), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (path.includes("/pulls/42")) {
+        detailCallCount++;
+        const state = detailCallCount === 1 ? "unknown" : "conflicted";
+        return new Response(JSON.stringify({ number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: state, base: { ref: "main" } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (path.includes("/commits/abc123/check-runs")) {
+        return new Response(JSON.stringify({ check_runs: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response('{"message":"Not Found"}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(detailCallCount).toBe(2); // retried once
+    expect(result.conflictingPrs).toHaveLength(1);
+  });
+});
+
+describe("isPrConflicted", () => {
+  it("returns true for 'conflicted'", () => {
+    expect(isPrConflicted("conflicted")).toBe(true);
+  });
+
+  it("returns false for 'behind' (needs rebase but no conflicts)", () => {
+    expect(isPrConflicted("behind")).toBe(false);
+  });
+
+  it("returns false for 'blocked' (failing required checks)", () => {
+    expect(isPrConflicted("blocked")).toBe(false);
+  });
+
+  it("returns false for 'dirty' (PR's own commits have conflicts)", () => {
+    expect(isPrConflicted("dirty")).toBe(false);
+  });
+
+  it("returns false for 'clean' / 'unstable' / null / undefined", () => {
+    expect(isPrConflicted("clean")).toBe(false);
+    expect(isPrConflicted("unstable")).toBe(false);
+    expect(isPrConflicted(null)).toBe(false);
+    expect(isPrConflicted(undefined)).toBe(false);
+  });
+});
+
+describe("fetchPrDetail", () => {
+  it("fetches a single PR's full data from /pulls/{number}", async () => {
+    const pr = { number: 42, head: { ref: "feat", sha: "abc" }, mergeable_state: "conflicted", base: { ref: "main" } };
+    const fetchFn = mockFetch({ "/pulls/42": pr });
+    const result = await fetchPrDetail("owner/repo", 42, "tok", { fetch: fetchFn });
+    expect(result).toEqual(pr);
+    expect(result.mergeable_state).toBe("conflicted");
+  });
+
+  it("throws on non-OK response", async () => {
+    const fetchFn = vi.fn(async () => new Response("{}", { status: 500 })) as unknown as typeof fetch;
+    await expect(fetchPrDetail("owner/repo", 42, "tok", { fetch: fetchFn })).rejects.toThrow();
   });
 });

@@ -386,6 +386,100 @@ describe("SessionManager", () => {
     expect(sessionMap.getBySession("s1")).toBeUndefined();
   });
 
+  it("repromptForMergeConflict prompts when the session is idle past the threshold", async () => {
+    sessionMap.record({ sessionID: "s1", repo: "owner/repo", prNumber: 42, branch: "feat", headSha: "abc", updatedAt: "t" });
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    const client: MockClient = {
+      getSession: vi.fn(async () => ({ ...makeSession("s1"), time: { created: 1, updated: oneHourAgo } })),
+      createSession: vi.fn(),
+      promptAsync: vi.fn(async () => {}),
+      listSessions: vi.fn(),
+      messages: vi.fn(),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    const outcome = await manager.repromptForMergeConflict("owner/repo", 42, "feat", "abc", "main", 30 * 60 * 1000);
+    expect(outcome).toBe("prompted");
+    expect(client.promptAsync).toHaveBeenCalledTimes(1);
+    const promptText = (client.promptAsync.mock.calls[0][1].parts[0] as { text: string }).text;
+    expect(promptText).toContain("Merge conflict detected");
+    expect(promptText).toContain("Rebase your branch on");
+    expect(promptText).toContain("main");
+    expect(promptText).toContain("resolve the conflicts");
+  });
+
+  it("repromptForMergeConflict skips when the session was updated recently", async () => {
+    sessionMap.record({ sessionID: "s1", repo: "owner/repo", prNumber: 42, branch: "feat", headSha: "abc", updatedAt: "t" });
+    const oneMinuteAgo = Date.now() - 60 * 1000;
+    const client: MockClient = {
+      getSession: vi.fn(async () => ({ ...makeSession("s1"), time: { created: 1, updated: oneMinuteAgo } })),
+      createSession: vi.fn(),
+      promptAsync: vi.fn(),
+      listSessions: vi.fn(),
+      messages: vi.fn(),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    const outcome = await manager.repromptForMergeConflict("owner/repo", 42, "feat", "abc", "main", 30 * 60 * 1000);
+    expect(outcome).toBe("skipped:idle");
+    expect(client.promptAsync).not.toHaveBeenCalled();
+  });
+
+  it("repromptForMergeConflict returns no-session when no mapping exists", async () => {
+    const client: MockClient = {
+      getSession: vi.fn(),
+      createSession: vi.fn(),
+      promptAsync: vi.fn(),
+      listSessions: vi.fn(),
+      messages: vi.fn(),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    const outcome = await manager.repromptForMergeConflict("owner/repo", 999, "feat", "abc", "main", 30 * 60 * 1000);
+    expect(outcome).toBe("skipped:no-session");
+    expect(client.getSession).not.toHaveBeenCalled();
+  });
+
+  it("repromptForMergeConflict uses a separate cooldown from ci_failure", async () => {
+    // A merge-conflict prompt should not suppress a subsequent ci_failure
+    // prompt for the same PR (different cooldown keys).
+    sessionMap.record({ sessionID: "s1", repo: "owner/repo", prNumber: 42, branch: "feat", headSha: "abc", updatedAt: "t" });
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    const client: MockClient = {
+      getSession: vi.fn(async () => ({ ...makeSession("s1"), time: { created: 1, updated: oneHourAgo } })),
+      createSession: vi.fn(),
+      promptAsync: vi.fn(async () => {}),
+      listSessions: vi.fn(),
+      messages: vi.fn(),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    // First: merge conflict prompt.
+    const outcome1 = await manager.repromptForMergeConflict("owner/repo", 42, "feat", "abc", "main", 30 * 60 * 1000);
+    expect(outcome1).toBe("prompted");
+
+    // Second: ci_failure prompt for the same PR — should NOT be in cooldown.
+    const outcome2 = await manager.repromptIfIdle("owner/repo", 42, "feat", "abc", ["Lint"], 30 * 60 * 1000);
+    expect(outcome2).toBe("prompted");
+    expect(client.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  it("repromptForMergeConflict deletes the session mapping if the session no longer exists", async () => {
+    sessionMap.record({ sessionID: "s1", repo: "owner/repo", prNumber: 42, branch: "feat", headSha: "abc", updatedAt: "t" });
+    const client: MockClient = {
+      getSession: vi.fn(async () => { throw new Error("404"); }),
+      createSession: vi.fn(),
+      promptAsync: vi.fn(),
+      listSessions: vi.fn(),
+      messages: vi.fn(),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    const outcome = await manager.repromptForMergeConflict("owner/repo", 42, "feat", "abc", "main", 30 * 60 * 1000);
+    expect(outcome).toBe("skipped:no-session");
+    expect(sessionMap.getBySession("s1")).toBeUndefined();
+  });
+
   it("does not match a session already mapped to a different branch even if /vcs reports the event branch", async () => {
     // ses_existing is mapped to branch "feat-a" in the session map.
     sessionMap.record({ sessionID: "ses_existing", repo: "owner/repo", prNumber: 100, branch: "feat-a", headSha: "sha-a", updatedAt: "t" });

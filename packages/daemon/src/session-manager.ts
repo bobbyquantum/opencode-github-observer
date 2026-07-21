@@ -538,6 +538,78 @@ export class SessionManager {
       return "skipped:no-session";
     }
   }
+
+  // Called by the watchdog when a PR has a merge conflict. Finds the mapped
+  // session and prompts it to rebase on the base branch and resolve conflicts,
+  // IF the session is idle past the threshold (so we don't interrupt active
+  // work). Uses a separate cooldown key namespace (`merge_conflict`) so a
+  // rebase prompt doesn't interfere with a ci_failure prompt for the same PR.
+  // Returns "prompted" | "skipped:idle" | "skipped:no-session" | "skipped:cooldown"
+  async repromptForMergeConflict(
+    repo: string,
+    prNumber: number,
+    branch: string,
+    headSha: string,
+    baseRef: string,
+    idleThresholdMs: number,
+  ): Promise<string> {
+    const repoConfig = this.deps.repos[repo];
+    if (!repoConfig) return "skipped:no-session";
+
+    const mapped = this.deps.sessionMap.lookup(repo, { prNumber });
+    if (!mapped) return "skipped:no-session";
+
+    let client: OpencodeClient;
+    try {
+      const server = await this.deps.serverManager.ensure(repoConfig.workdir, repoConfig.serverUrl, repoConfig.serverPassword);
+      client = server.client;
+    } catch (err) {
+      logger.error(`watchdog: could not reach opencode server for ${repo}`, err);
+      return "skipped:no-session";
+    }
+
+    let session: Session;
+    try {
+      session = await client.getSession(mapped.sessionID);
+    } catch {
+      logger.warn(`watchdog: mapped session ${mapped.sessionID} no longer exists for ${repo}#${prNumber}`);
+      this.deps.sessionMap.delete(mapped.sessionID);
+      await this.deps.sessionMap.persist();
+      return "skipped:no-session";
+    }
+
+    const idleMs = Date.now() - session.time.updated;
+    if (idleMs < idleThresholdMs) {
+      return "skipped:idle";
+    }
+
+    // Distinct cooldown key from ci_failure so a merge-conflict prompt and a
+    // CI-failure prompt for the same PR don't suppress each other.
+    const cooldownKey = `${repo}:merge_conflict:${prNumber}`;
+    if (this.isInCooldown(cooldownKey)) {
+      return "skipped:cooldown";
+    }
+
+    const prompt = [
+      `Merge conflict detected on ${repo}#${prNumber}.`,
+      ``,
+      `Branch "${branch}" has conflicts with the base branch "${baseRef}".`,
+      `Head commit: ${headSha}`,
+      `URL: https://github.com/${repo}/pull/${prNumber}`,
+      ``,
+      `Rebase your branch on "${baseRef}" and resolve the conflicts, then push the updated branch. If a conflict is non-trivial, prefer merging "${baseRef}" into "${branch}" and resolving in your worktree rather than abandoning the PR.`,
+    ].join("\n");
+
+    try {
+      this.setCooldown(cooldownKey);
+      await client.promptAsync(mapped.sessionID, { parts: [{ type: "text", text: prompt }] });
+      logger.info(`watchdog: re-prompted session ${mapped.sessionID} for ${repo}#${prNumber} merge conflict (idle ${(idleMs / 60_000).toFixed(1)}min)`);
+      return "prompted";
+    } catch (err) {
+      logger.error(`watchdog: failed to prompt session ${mapped.sessionID} for merge conflict`, err);
+      return "skipped:no-session";
+    }
+  }
 }
 
 export function buildPrompt(event: ActionableEvent): string {

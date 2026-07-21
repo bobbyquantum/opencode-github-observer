@@ -26,6 +26,17 @@ export type FailingPr = {
   failNames: string[];
 };
 
+// A PR with a merge conflict (mergeable_state === "conflicted"). The base
+// branch has moved ahead and the PR's branch needs a rebase to land cleanly.
+// Without intervention these PRs sit forever — the watchdog prompts the
+// session to pull the base branch and resolve conflicts.
+export type ConflictingPr = {
+  prNumber: number;
+  branch: string;
+  headSha: string;
+  baseRef: string;
+};
+
 export type WatchdogResult = {
   // PRs that are currently failing CI AND have a fresh entry in the
   // branch-pr cache (so we know which session to re-prompt).
@@ -33,6 +44,9 @@ export type WatchdogResult = {
   // PRs that were failing but had no session mapping (daemon hasn't seen
   // them yet — needs an initial event to create the session).
   unmappedPrs: FailingPr[];
+  // PRs with merge conflicts that have a fresh session mapping. The session
+  // is prompted to rebase on the base branch and resolve conflicts.
+  conflictingPrs: ConflictingPr[];
 };
 
 export type GithubApiDeps = {
@@ -42,6 +56,10 @@ export type GithubApiDeps = {
 type Pull = {
   number: number;
   head: { ref: string; sha: string };
+  // mergeable_state is computed asynchronously by GitHub; can be null when
+  // GitHub hasn't finished computing it yet (fresh PR).
+  mergeable_state?: string | null;
+  base?: { ref: string };
 };
 
 type CheckRun = {
@@ -97,6 +115,29 @@ export async function fetchFailingChecks(
   return Array.from(new Set(failNames));
 }
 
+// Fetches a single PR's full data, including mergeable_state. GitHub
+// computes mergeable_state asynchronously, so the list endpoint returns null
+// for all PRs. Fetching a PR individually triggers computation; if the first
+// call returns "unknown", a second call shortly after returns the real state.
+export async function fetchPrDetail(
+  repo: string,
+  prNumber: number,
+  token: string,
+  deps: GithubApiDeps = {},
+): Promise<Pull & { mergeable_state?: string | null }> {
+  const fetchFn = deps.fetch ?? globalThis.fetch;
+  const url = `https://api.github.com/repos/${repo}/pulls/${prNumber}`;
+  const res = await fetchFn(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "opencode-observer-watchdog",
+    },
+  });
+  if (!res.ok) throw new Error(`fetchPrDetail ${repo}#${prNumber} returned ${res.status}`);
+  return (await res.json()) as Pull;
+}
+
 // Determines if a PR's branch-pr cache entry is fresh enough to consider.
 export function isPrEntryFresh(updatedAt: string, now: number, maxAgeMs: number): boolean {
   const ts = Date.parse(updatedAt);
@@ -104,13 +145,33 @@ export function isPrEntryFresh(updatedAt: string, now: number, maxAgeMs: number)
   return now - ts < maxAgeMs;
 }
 
-// Scans open PRs on a repo for current CI failures. Returns:
+// Returns true if the PR's mergeable_state indicates a real merge conflict
+// that needs a rebase. GitHub's `mergeable_state` can be "conflicted",
+// "dirty", "blocked", "behind", "unstable", etc. We only act on "conflicted"
+// — the others are not fixable by a simple rebase (dirty = merge conflicts in
+// the PR's own commits, blocked = failing required checks, behind = just
+// needs a rebase but no conflicts yet, unstable = failing checks but mergeable).
+export function isPrConflicted(mergeableState: string | null | undefined): boolean {
+  return mergeableState === "conflicted";
+}
+
+// Scans open PRs on a repo for current CI failures AND merge conflicts.
+// Returns:
 //   - failingPrs: PRs failing CI that have a fresh session mapping in the
 //     branch-pr cache (so the daemon knows which session to re-prompt)
 //   - unmappedPrs: PRs failing CI that have no session mapping yet (the
 //     daemon needs an initial event to create a session)
+//   - conflictingPrs: PRs with merge conflicts that have a fresh session
+//     mapping. The session is prompted to pull the base branch and resolve
+//     conflicts.
 // The caller (daemon) is responsible for deciding whether to actually re-prompt
 // based on each session's last-activity timestamp (via SessionManager).
+//
+// NOTE on mergeable_state: GitHub computes this asynchronously. The list
+// endpoint (/pulls?state=open) returns mergeable_state=null for all PRs.
+// To get the real state, we fetch each cached PR individually — this triggers
+// computation. If the first call returns "unknown", we retry once after a
+// short delay.
 export async function findFailingPrs(
   repo: string,
   token: string,
@@ -121,16 +182,63 @@ export async function findFailingPrs(
   const now = Date.now();
   const failingPrs: FailingPr[] = [];
   const unmappedPrs: FailingPr[] = [];
+  const conflictingPrs: ConflictingPr[] = [];
 
   let prs: Pull[];
   try {
     prs = await fetchOpenPrs(repo, token, config.maxPrsPerRun, deps);
   } catch (err) {
     logger.warn(`watchdog: failed to fetch open PRs for ${repo}`, err);
-    return { failingPrs, unmappedPrs };
+    return { failingPrs, unmappedPrs, conflictingPrs };
   }
 
+  // For each PR that has a fresh cache entry, fetch full detail to get the
+  // real mergeable_state. The list endpoint returns null for all PRs because
+  // GitHub computes mergeability asynchronously. Only fetch detail for PRs
+  // we're tracking (have a cache entry) to avoid hitting the API for every
+  // open PR.
+  const cachedPrNumbers = new Set<number>();
   for (const pr of prs) {
+    const entry = cache.lookupByPr(repo, pr.number);
+    if (entry && entry.headSha && isPrEntryFresh(entry.updatedAt, now, config.prMaxAgeMs)) {
+      cachedPrNumbers.add(pr.number);
+    }
+  }
+
+  // Fetch detail for cached PRs in parallel (with one retry if the first
+  // call returns "unknown").
+  const detailByNumber = new Map<number, Pull>();
+  await Promise.all(
+    Array.from(cachedPrNumbers).map(async (prNumber) => {
+      try {
+        let detail = await fetchPrDetail(repo, prNumber, token, deps);
+        if (detail.mergeable_state === "unknown") {
+          // GitHub hasn't finished computing — retry once after a short delay.
+          await new Promise((r) => setTimeout(r, 500));
+          detail = await fetchPrDetail(repo, prNumber, token, deps);
+        }
+        detailByNumber.set(prNumber, detail);
+      } catch (err) {
+        logger.debug(`watchdog: failed to fetch PR detail for ${repo}#${prNumber}`, err);
+      }
+    }),
+  );
+
+  for (const pr of prs) {
+    // Check for merge conflicts using the detailed PR data (if we fetched it).
+    const detail = detailByNumber.get(pr.number) ?? pr;
+    if (isPrConflicted(detail.mergeable_state)) {
+      const entry = cache.lookupByPr(repo, pr.number);
+      if (entry && entry.headSha && isPrEntryFresh(entry.updatedAt, now, config.prMaxAgeMs)) {
+        conflictingPrs.push({
+          prNumber: pr.number,
+          branch: pr.head.ref,
+          headSha: pr.head.sha,
+          baseRef: detail.base?.ref ?? "main",
+        });
+      }
+    }
+
     let failNames: string[];
     try {
       failNames = await fetchFailingChecks(repo, pr.head.sha, token, deps);
@@ -159,5 +267,5 @@ export async function findFailingPrs(
     failingPrs.push(candidate);
   }
 
-  return { failingPrs, unmappedPrs };
+  return { failingPrs, unmappedPrs, conflictingPrs };
 }
