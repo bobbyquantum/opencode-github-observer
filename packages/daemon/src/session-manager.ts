@@ -356,25 +356,22 @@ export class SessionManager {
       return this.searchByMessages(client, searchable, event, repoName);
     }
 
-    // VALIDATION: even with a strong /vcs branch match, verify the session's
+    // VALIDATION: for any candidate with a strong score, verify the session's
     // first user message references the event's branch/PR. A worktree can be
     // reassigned to a different branch while its session is about a totally
-    // unrelated topic — a bare /vcs match is unsafe. If the top candidate
-    // fails this check, fall through to message search.
-    const top = candidates[0];
-    if (top.score >= 2000 && top.s.directory && event.headRef) {
-      const relevant = await this.sessionRelevantToEvent(client, top.s.id, event);
-      if (!relevant) {
-        // Demote the top candidate and try the next, or fall through to
-        // message search.
-        const remaining = candidates.slice(1);
-        if (remaining.length > 0 && remaining[0].score >= 100) return remaining[0].s;
-        const searchable = sessions.filter((s) => !sessionsOnOtherBranch.has(s.id) && s.id !== top.s.id);
-        return this.searchByMessages(client, searchable, event, repoName);
-      }
+    // unrelated topic — directory/repo-name matches are unsafe on their own.
+    // Walk the candidates in score order, returning the first that's
+    // relevant. If none are relevant, fall through to message search.
+    for (const candidate of candidates) {
+      if (candidate.score < 100) break;
+      const relevant = await this.sessionRelevantToEvent(client, candidate.s.id, event);
+      if (relevant) return candidate.s;
     }
 
-    return candidates[0].s;
+    // No scored candidate passed validation — fall back to message search.
+    // Also exclude sessions on other branches from the message search.
+    const searchable = sessions.filter((s) => !sessionsOnOtherBranch.has(s.id));
+    return this.searchByMessages(client, searchable, event, repoName);
   }
 
   // Returns true if the session's first user message mentions the event's
