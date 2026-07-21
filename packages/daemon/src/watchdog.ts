@@ -145,15 +145,24 @@ export function isPrEntryFresh(updatedAt: string, now: number, maxAgeMs: number)
   return now - ts < maxAgeMs;
 }
 
-// Returns true if the PR's mergeable_state indicates a real merge conflict
-// that needs a rebase. GitHub's `mergeable_state` can be "conflicted",
-// "dirty", "blocked", "behind", "unstable", etc. We only act on "conflicted"
-// — the others are not fixable by a simple rebase (dirty = merge conflicts in
-// the PR's own commits, blocked = failing required checks, behind = just
-// needs a rebase but no conflicts yet, unstable = failing checks but mergeable).
-export function isPrConflicted(mergeableState: string | null | undefined): boolean {
-  return mergeableState === "conflicted";
+// Returns true if the PR's mergeable_state indicates the branch is unmergable
+// and needs intervention (rebase or conflict resolution). GitHub's states:
+//   - "conflicted" — base branch moved ahead, rebase needed
+//   - "dirty" — PR's own commits conflict with base; needs rebase or
+//     conflict resolution (a simple rebase may not be enough)
+//   - "behind" — base moved ahead but no conflicts (rebase nice-to-have,
+//     not required — NOT actionable)
+//   - "blocked" — failing required checks (handled by CI-failure detection)
+//   - "unstable" — failing checks but mergeable (handled by CI-failure)
+//   - "clean" — mergeable, no action needed
+// We act on "conflicted" and "dirty" — both mean the branch can't merge.
+export function isPrUnmergable(mergeableState: string | null | undefined): boolean {
+  return mergeableState === "conflicted" || mergeableState === "dirty";
 }
+
+// Back-compat alias for the old name; isPrConflicted now returns true for
+// both conflicted and dirty. Prefer isPrUnmergable in new code.
+export const isPrConflicted = isPrUnmergable;
 
 // Scans open PRs on a repo for current CI failures AND merge conflicts.
 // Returns:

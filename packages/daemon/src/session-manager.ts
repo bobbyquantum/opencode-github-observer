@@ -539,11 +539,12 @@ export class SessionManager {
     }
   }
 
-  // Called by the watchdog when a PR has a merge conflict. Finds the mapped
-  // session and prompts it to rebase on the base branch and resolve conflicts,
-  // IF the session is idle past the threshold (so we don't interrupt active
-  // work). Uses a separate cooldown key namespace (`merge_conflict`) so a
-  // rebase prompt doesn't interfere with a ci_failure prompt for the same PR.
+  // Called by the watchdog when a PR is unmergable (mergeable_state is
+  // "conflicted" or "dirty"). Finds the mapped session and prompts it to
+  // rebase on the base branch and resolve conflicts, IF the session is idle
+  // past the threshold (so we don't interrupt active work). Uses a separate
+  // cooldown key namespace (`merge_conflict`) so a rebase prompt doesn't
+  // interfere with a ci_failure prompt for the same PR.
   // Returns "prompted" | "skipped:idle" | "skipped:no-session" | "skipped:cooldown"
   async repromptForMergeConflict(
     repo: string,
@@ -593,11 +594,11 @@ export class SessionManager {
     const prompt = [
       `Merge conflict detected on ${repo}#${prNumber}.`,
       ``,
-      `Branch "${branch}" has conflicts with the base branch "${baseRef}".`,
+      `Branch "${branch}" has conflicts with the base branch "${baseRef}" and cannot be merged cleanly.`,
       `Head commit: ${headSha}`,
       `URL: https://github.com/${repo}/pull/${prNumber}`,
       ``,
-      `Rebase your branch on "${baseRef}" and resolve the conflicts, then push the updated branch. If a conflict is non-trivial, prefer merging "${baseRef}" into "${branch}" and resolving in your worktree rather than abandoning the PR.`,
+      `Rebase your branch on "${baseRef}" and resolve the conflicts, then push the updated branch. If the conflicts are non-trivial (e.g. the branch has diverged significantly), consider merging "${baseRef}" into "${branch}" and resolving in your worktree rather than abandoning the PR. After resolving, verify CI passes before requesting review.`,
     ].join("\n");
 
     try {

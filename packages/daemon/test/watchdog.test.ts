@@ -9,6 +9,7 @@ import {
   fetchPrDetail,
   findFailingPrs,
   isPrEntryFresh,
+  isPrUnmergable,
   isPrConflicted,
   DEFAULT_WATCHDOG_CONFIG,
   type WatchdogConfig,
@@ -229,9 +230,10 @@ describe("findFailingPrs", () => {
     expect(result.conflictingPrs).toHaveLength(0);
   });
 
-  it("skips PRs that are behind but not conflicted", async () => {
+  it("skips PRs that are behind but not conflicted or dirty", async () => {
     // "behind" means the base has moved ahead but there are no conflicts —
-    // a rebase would be nice but isn't required. Only "conflicted" is actionable.
+    // a rebase would be nice but isn't required. Only "conflicted" and
+    // "dirty" are actionable.
     cache.record("owner/repo", "feat", 42, "abc123");
     const fetchFn = mockFetch({
       "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
@@ -240,6 +242,22 @@ describe("findFailingPrs", () => {
     });
     const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
     expect(result.conflictingPrs).toHaveLength(0);
+  });
+
+  it("reports a dirty PR as conflicting (dirty = unmergable, needs rebase)", async () => {
+    // "dirty" means the PR's own commits conflict with the base — the branch
+    // can't merge cleanly and needs intervention. Treat it the same as
+    // "conflicted".
+    cache.record("owner/repo", "feat", 42, "abc123");
+    const fetchFn = mockFetch({
+      "/pulls?state=open": [{ number: 42, head: { ref: "feat", sha: "abc123" } }],
+      "/pulls/42": { number: 42, head: { ref: "feat", sha: "abc123" }, mergeable_state: "dirty", base: { ref: "main" } },
+      "/commits/abc123/check-runs": { check_runs: [] },
+    });
+    const result = await findFailingPrs("owner/repo", "tok", cache, config, { fetch: fetchFn });
+    expect(result.conflictingPrs).toHaveLength(1);
+    expect(result.conflictingPrs[0].prNumber).toBe(42);
+    expect(result.conflictingPrs[0].baseRef).toBe("main");
   });
 
   it("a PR can be both conflicted and failing CI", async () => {
@@ -283,28 +301,41 @@ describe("findFailingPrs", () => {
   });
 });
 
-describe("isPrConflicted", () => {
-  it("returns true for 'conflicted'", () => {
-    expect(isPrConflicted("conflicted")).toBe(true);
+describe("isPrUnmergable (alias: isPrConflicted)", () => {
+  it("returns true for 'conflicted' (base moved ahead, rebase needed)", () => {
+    expect(isPrUnmergable("conflicted")).toBe(true);
+  });
+
+  it("returns true for 'dirty' (PR's own commits conflict with base)", () => {
+    expect(isPrUnmergable("dirty")).toBe(true);
   });
 
   it("returns false for 'behind' (needs rebase but no conflicts)", () => {
-    expect(isPrConflicted("behind")).toBe(false);
+    expect(isPrUnmergable("behind")).toBe(false);
   });
 
   it("returns false for 'blocked' (failing required checks)", () => {
-    expect(isPrConflicted("blocked")).toBe(false);
+    expect(isPrUnmergable("blocked")).toBe(false);
   });
 
-  it("returns false for 'dirty' (PR's own commits have conflicts)", () => {
-    expect(isPrConflicted("dirty")).toBe(false);
+  it("returns false for 'clean' (mergeable, no action needed)", () => {
+    expect(isPrUnmergable("clean")).toBe(false);
   });
 
-  it("returns false for 'clean' / 'unstable' / null / undefined", () => {
-    expect(isPrConflicted("clean")).toBe(false);
-    expect(isPrConflicted("unstable")).toBe(false);
-    expect(isPrConflicted(null)).toBe(false);
-    expect(isPrConflicted(undefined)).toBe(false);
+  it("returns false for 'unstable' (failing checks but mergeable)", () => {
+    expect(isPrUnmergable("unstable")).toBe(false);
+  });
+
+  it("returns false for null / undefined / 'unknown'", () => {
+    expect(isPrUnmergable(null)).toBe(false);
+    expect(isPrUnmergable(undefined)).toBe(false);
+    expect(isPrUnmergable("unknown")).toBe(false);
+  });
+
+  it("isPrConflicted is an alias for isPrUnmergable", () => {
+    expect(isPrConflicted).toBe(isPrUnmergable);
+    expect(isPrConflicted("dirty")).toBe(true);
+    expect(isPrConflicted("conflicted")).toBe(true);
   });
 });
 
