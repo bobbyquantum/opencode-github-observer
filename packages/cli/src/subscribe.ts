@@ -110,8 +110,19 @@ export async function subscribeCommand(args: string[]): Promise<void> {
     // No existing map.
   }
 
-  // Remove any existing entry for this session (re-subscribe).
-  map = map.filter((r) => r.sessionID !== sessionID);
+  // Enforce one PR → one session: remove any existing mapping for this PR
+  // number (even if it's a different session). Also remove any existing
+  // mapping for THIS session (re-subscribe to a different PR).
+  const before = map.length;
+  map = map.filter((r) => {
+    if (r.sessionID === sessionID) return false; // re-subscribing this session
+    if (prNumber && r.prNumber === prNumber) return false; // PR already linked to another session
+    return true;
+  });
+  const removedCount = before - map.length;
+  if (removedCount > 0) {
+    console.log(`Unlinked ${removedCount} previous mapping(s) for this PR/session.`);
+  }
 
   // Add the new mapping.
   const record: SessionRecord = {
