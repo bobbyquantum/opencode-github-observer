@@ -526,40 +526,68 @@ describe("SessionManager", () => {
     await manager.handleEvent(makeEvent({ headRef: "feat-b", prNumber: 200, headSha: "sha-b" }));
 
     // ses_unrelated should NOT have been prompted — its first user message
-    // doesn't mention "feat-b" or "#200".
+    // doesn't mention "feat-b" or "#200" AND it's not recently active (the
+    // test session has time.updated=1, which is epoch — well over 7 days old).
     expect(client.promptAsync).not.toHaveBeenCalledWith("ses_unrelated", expect.anything());
     // A new session should have been created.
     expect(client.createSession).toHaveBeenCalled();
   });
 
-  it("resolveSessionID re-validates a cached mapping and re-searches if the session is not relevant", async () => {
-    // The session map has a stale/wrong mapping from a pre-validation bug:
-    // ses_ha_ingress (about HA Ingress) is mapped to #9999 (typescript bump).
-    // When a CI failure for #9999 arrives, the daemon should detect the
-    // mismatch, delete the mapping, and search/create a new session instead
-    // of prompting the wrong session.
-    sessionMap.record({ sessionID: "ses_ha_ingress", repo: "owner/repo", prNumber: 9999, branch: "renovate/typescript", headSha: "sha-ts", updatedAt: "t" });
+  it("matches a primary session via /vcs branch match when it's recently active, even if its first user message doesn't mention the branch", async () => {
+    // This is the "README todo implementation" case: a primary session that
+    // created the work (e.g. "Please select a readme todo item") which later
+    // became a PR. Its first message doesn't mention the branch/PR, but it's
+    // the originating session because its worktree is on the event's branch
+    // and it's been active recently.
+    const recentMs = Date.now();
     const client: MockClient = {
-      getSession: vi.fn(async () => makeSession("ses_ha_ingress", "/r/repo")),
+      getSession: vi.fn(),
       createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
       promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => []),
-      messages: vi.fn(async () => [
-        // First user message is about HA Ingress — not relevant to typescript bump.
-        { info: { id: "m1", sessionID: "ses_ha_ingress", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_ha_ingress", messageID: "m1", type: "text", text: "Please research home assistant ingress" }] },
+      listSessions: vi.fn(async () => [
+        // Primary session, recently updated, first message doesn't mention the branch.
+        { ...makeSession("ses_readme_todo", "/r/repo"), title: "README todo implementation", time: { created: 1, updated: recentMs } },
       ]),
+      messages: vi.fn(async () => [
+        { info: { id: "m1", sessionID: "ses_readme_todo", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_readme_todo", messageID: "m1", type: "text", text: "Please select a readme todo item and implement" }] },
+      ]),
+      vcsInfoForDirectory: vi.fn(async () => ({ branch: "lunar-aardvark", default_branch: "main" })),
     };
     const manager = makeManager(client, sessionMap);
 
-    await manager.handleEvent(makeEvent({ headRef: "renovate/typescript", prNumber: 9999, headSha: "sha-ts" }));
+    await manager.handleEvent(makeEvent({ headRef: "lunar-aardvark", prNumber: 1200, headSha: "sha-1200" }));
 
-    // ses_ha_ingress should NOT have been prompted.
+    // ses_readme_todo SHOULD have been prompted — it's the originating session.
+    expect(client.promptAsync).toHaveBeenCalledWith("ses_readme_todo", expect.anything());
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("does not match a primary session via /vcs when it's been idle for > 7 days (stale worktree reassignment)", async () => {
+    // Same as above but the session hasn't been updated in 9 days — the
+    // worktree has been reassigned to a different branch and the session is
+    // stale for this branch.
+    const nineDaysAgo = Date.now() - 9 * 24 * 60 * 60 * 1000;
+    const client: MockClient = {
+      getSession: vi.fn(),
+      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
+      promptAsync: vi.fn(async () => {}),
+      listSessions: vi.fn(async () => [
+        { ...makeSession("ses_ha_ingress", "/r/repo"), title: "Home Assistant Ingress", time: { created: 1, updated: nineDaysAgo } },
+      ]),
+      messages: vi.fn(async () => [
+        { info: { id: "m1", sessionID: "ses_ha_ingress", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_ha_ingress", messageID: "m1", type: "text", text: "Please research home assistant ingress" }] },
+      ]),
+      vcsInfoForDirectory: vi.fn(async () => ({ branch: "renovate/typescript-7.x", default_branch: "main" })),
+    };
+    const manager = makeManager(client, sessionMap);
+
+    await manager.handleEvent(makeEvent({ headRef: "renovate/typescript-7.x", prNumber: 1194, headSha: "sha-ts" }));
+
+    // ses_ha_ingress should NOT have been prompted — it's stale (idle > 7 days).
     expect(client.promptAsync).not.toHaveBeenCalledWith("ses_ha_ingress", expect.anything());
-    // The mapping should have been deleted.
-    expect(sessionMap.getBySession("ses_ha_ingress")).toBeUndefined();
-    // A new session should have been created.
     expect(client.createSession).toHaveBeenCalled();
   });
+
 });
 
 describe("buildPrompt", () => {

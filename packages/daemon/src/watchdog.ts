@@ -13,7 +13,7 @@ export type WatchdogConfig = {
 };
 
 export const DEFAULT_WATCHDOG_CONFIG: WatchdogConfig = {
-  idleThresholdMs: 30 * 60 * 1000, // 30 min
+  idleThresholdMs: 15 * 60 * 1000, // 15 min
   prMaxAgeMs: 7 * 24 * 60 * 60 * 1000, // 7 days
   maxPrsPerRun: 30,
 };

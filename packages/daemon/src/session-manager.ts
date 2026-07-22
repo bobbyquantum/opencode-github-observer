@@ -222,23 +222,13 @@ export class SessionManager {
     if (existing) {
       try {
         const session = await client.getSession(existing.sessionID);
-        // VALIDATION: verify the mapped session is still relevant to this
-        // event. The session map can contain stale/wrong mappings from a
-        // pre-validation bug (worktrees reassigned to different branches
-        // matched the wrong sessions via /vcs). Reject and re-search if the
-        // session's first user message doesn't reference the event's
-        // branch/PR. This self-heals the session map over time.
-        const relevant = await this.sessionRelevantToEvent(client, session.id, event);
-        if (!relevant) {
-          logger.warn(`Mapped session ${existing.sessionID} for ${repo}#${event.prNumber || event.headRef} is not relevant to the event (first user message doesn't mention branch/PR); re-searching`);
-          this.deps.sessionMap.delete(existing.sessionID);
-          await this.deps.sessionMap.persist();
-          // Fall through to searchSessions.
-        } else {
-          // Refresh mapping with PR number / headSha if we now know them.
-          this.recordResolved(session, repo, event);
-          return session.id;
-        }
+        // Trust the session map — it was validated at creation time by
+        // recordResolved + searchSessions. Re-validating here is expensive
+        // (fetches messages + /vcs) and can have false negatives (e.g. /vcs
+        // fails because the worktree was temporarily reassigned). The
+        // validation lives in searchSessions where new mappings are created.
+        this.recordResolved(session, repo, event);
+        return session.id;
       } catch {
         logger.warn(`Mapped session ${existing.sessionID} no longer exists; searching`);
         this.deps.sessionMap.delete(existing.sessionID);
@@ -356,15 +346,26 @@ export class SessionManager {
       return this.searchByMessages(client, searchable, event, repoName);
     }
 
-    // VALIDATION: for any candidate with a strong score, verify the session's
-    // first user message references the event's branch/PR. A worktree can be
+    // VALIDATION: for any candidate with a strong score, verify the session
+    // is actually the originating session for this event. A worktree can be
     // reassigned to a different branch while its session is about a totally
     // unrelated topic — directory/repo-name matches are unsafe on their own.
+    //
+    // Relevance rules (a session is relevant if ANY is true):
+    //   1. Primary session (no parentID) AND its worktree's current branch
+    //      matches the event's headRef. This is the originating session —
+    //      its first user message may not mention the branch/PR because the
+    //      session predates the PR (e.g. "Please select a readme todo item
+    //      and implement" → became PR #1200 lunar-aardvark).
+    //   2. The session's first user message mentions the event's branch or
+    //      PR number. This catches sessions that were created in response to
+    //      the PR (e.g. CI failure events include the branch in the prompt).
+    //
     // Walk the candidates in score order, returning the first that's
     // relevant. If none are relevant, fall through to message search.
     for (const candidate of candidates) {
       if (candidate.score < 100) break;
-      const relevant = await this.sessionRelevantToEvent(client, candidate.s.id, event);
+      const relevant = await this.isSessionRelevant(client, candidate.s, event);
       if (relevant) return candidate.s;
     }
 
@@ -372,6 +373,38 @@ export class SessionManager {
     // Also exclude sessions on other branches from the message search.
     const searchable = sessions.filter((s) => !sessionsOnOtherBranch.has(s.id));
     return this.searchByMessages(client, searchable, event, repoName);
+  }
+
+  // Returns true if the session is the originating session for this event.
+  // See the comment above searchSessions for the full relevance rules.
+  private async isSessionRelevant(
+    client: OpencodeClient,
+    session: Session,
+    event: ActionableEvent,
+  ): Promise<boolean> {
+    // Rule 1: primary session with worktree on the event's branch AND the
+    // session has been active recently (within 7 days). This is the
+    // originating session — its first user message may not mention the
+    // branch/PR because the session predates the PR (e.g. "Please select a
+    // readme todo item and implement" → became PR #1200 lunar-aardvark).
+    // The recency guard prevents matching stale sessions whose worktrees
+    // have been reassigned to unrelated branches (e.g. a 9-day-old "Home
+    // Assistant Ingress" session whose worktree got checked out to
+    // renovate/typescript-7.x — that session didn't create the typescript work).
+    if (!session.parentID && session.directory && event.headRef) {
+      const ageMs = Date.now() - session.time.updated;
+      const RECENT_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+      if (ageMs < RECENT_THRESHOLD_MS) {
+        try {
+          const vcs = await client.vcsInfoForDirectory(session.directory);
+          if (vcs.branch === event.headRef) return true;
+        } catch {
+          // VCS query failed — fall through to rule 2.
+        }
+      }
+    }
+    // Rule 2: first user message mentions the branch or PR.
+    return this.sessionRelevantToEvent(client, session.id, event);
   }
 
   // Returns true if the session's first user message mentions the event's
@@ -509,33 +542,6 @@ export class SessionManager {
       return "skipped:no-session";
     }
 
-    // VALIDATION: verify the mapped session is still relevant to this PR.
-    // The session map can contain stale/wrong mappings from a pre-validation
-    // bug (worktrees reassigned to different branches matched the wrong
-    // sessions via /vcs). Reject if the session's first user message doesn't
-    // reference the PR — the watchdog would be prompting a session that has
-    // no context about this PR.
-    const relevant = await this.sessionRelevantToEvent(client, session.id, {
-      type: "ci_failure",
-      repo,
-      repoFullName: repo,
-      prNumber,
-      prTitle: "",
-      headSha,
-      headRef: branch,
-      baseRef: "",
-      message: "",
-      htmlUrl: `https://github.com/${repo}/pull/${prNumber}`,
-      sender: "watchdog",
-      timestamp: new Date().toISOString(),
-    });
-    if (!relevant) {
-      logger.warn(`watchdog: mapped session ${mapped.sessionID} for ${repo}#${prNumber} is not relevant (first user message doesn't mention branch/PR); removing mapping`);
-      this.deps.sessionMap.delete(mapped.sessionID);
-      await this.deps.sessionMap.persist();
-      return "skipped:no-session";
-    }
-
     const idleMs = Date.now() - session.time.updated;
     if (idleMs < idleThresholdMs) {
       return "skipped:idle";
@@ -612,30 +618,6 @@ export class SessionManager {
       session = await client.getSession(mapped.sessionID);
     } catch {
       logger.warn(`watchdog: mapped session ${mapped.sessionID} no longer exists for ${repo}#${prNumber}`);
-      this.deps.sessionMap.delete(mapped.sessionID);
-      await this.deps.sessionMap.persist();
-      return "skipped:no-session";
-    }
-
-    // VALIDATION: verify the mapped session is still relevant to this PR.
-    // Same guard as repromptIfIdle — don't prompt a session that has no
-    // context about the PR (e.g. a stale mapping from the worktree-reuse bug).
-    const relevant = await this.sessionRelevantToEvent(client, session.id, {
-      type: "ci_failure",
-      repo,
-      repoFullName: repo,
-      prNumber,
-      prTitle: "",
-      headSha,
-      headRef: branch,
-      baseRef,
-      message: "",
-      htmlUrl: `https://github.com/${repo}/pull/${prNumber}`,
-      sender: "watchdog",
-      timestamp: new Date().toISOString(),
-    });
-    if (!relevant) {
-      logger.warn(`watchdog: mapped session ${mapped.sessionID} for ${repo}#${prNumber} merge conflict is not relevant; removing mapping`);
       this.deps.sessionMap.delete(mapped.sessionID);
       await this.deps.sessionMap.persist();
       return "skipped:no-session";
