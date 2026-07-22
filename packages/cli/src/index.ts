@@ -7,9 +7,10 @@ import { watchCommand } from "./watch.js";
 import { statusCommand } from "./status.js";
 import { sessionsCommand } from "./sessions.js";
 import { stallsCommand } from "./stalls.js";
+import { subscribeCommand } from "./subscribe.js";
 
 const USAGE = `
-opencode-observer - Self-hosted GitHub webhook observer
+opencode-observer - Self-hosted GitHub webhook auto-fix daemon
 
 Usage:
   opencode-observer auth                    Login with GitHub OAuth
@@ -21,6 +22,8 @@ Usage:
   opencode-observer daemon uninstall        Uninstall system service
   opencode-observer config get [key]        Show config
   opencode-observer config set <key> <val>  Set config value (dotted keys supported)
+  opencode-observer subscribe --repo <owner/repo> --pr <n> [--branch <b>] [--session <id>]
+                                            Subscribe current session to PR events
   opencode-observer watch <owner/repo>      Watch a repo for events (live)
   opencode-observer sessions                List detected PR ↔ opencode session mappings
   opencode-observer stalls [--abort]       Detect stalled sessions (add --abort to kill them)
@@ -50,6 +53,9 @@ async function main(): Promise<void> {
       break;
     case "stalls":
       await stallsCommand(args.slice(1));
+      break;
+    case "subscribe":
+      await subscribeCommand(args.slice(1));
       break;
     case "status":
       await statusCommand();

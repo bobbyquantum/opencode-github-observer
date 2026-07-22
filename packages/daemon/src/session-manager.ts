@@ -28,12 +28,6 @@ export type SessionManagerDeps = {
   cooldownMs?: number;
 };
 
-const SEARCH_SESSION_LIMIT = 20;
-
-// Dedup window: don't re-prompt the same session for the same event signature
-// within this period. Default 5 minutes — long enough to absorb a batch of
-// coderabbit comments or a multi-shard CI failure, short enough to react to a
-// genuinely new failure on the same branch.
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 
 type CooldownKey = string;
@@ -208,9 +202,14 @@ export class SessionManager {
     this.cooldowns.set(key, { expires: Date.now() + this.cooldownMs });
   }
 
-  // 1. Map lookup by branch / headSha / prNumber.
-  // 2. Fallback: search existing sessions for a mention of the branch or PR.
-  // 3. Otherwise: create a new session.
+  // Resolves the session for an event. The session map is the sole source of
+  // truth — agents explicitly subscribe their session to a PR via
+  // `opencode-observer subscribe`. No guessing, no heuristics.
+  //
+  // 1. Look up the session map by branch / headSha / prNumber.
+  // 2. If found and the session still exists, use it.
+  // 3. If not found, create a new session (the agent can subscribe later to
+  //    claim it, or the mapping stays as-is for future events on this branch).
   async resolveSessionID(client: OpencodeClient, event: ActionableEvent): Promise<string> {
     const repo = event.repo;
     const existing = this.deps.sessionMap.lookup(repo, {
@@ -222,266 +221,19 @@ export class SessionManager {
     if (existing) {
       try {
         const session = await client.getSession(existing.sessionID);
-        // Trust the session map — it was validated at creation time by
-        // recordResolved + searchSessions. Re-validating here is expensive
-        // (fetches messages + /vcs) and can have false negatives (e.g. /vcs
-        // fails because the worktree was temporarily reassigned). The
-        // validation lives in searchSessions where new mappings are created.
         this.recordResolved(session, repo, event);
         return session.id;
       } catch {
-        logger.warn(`Mapped session ${existing.sessionID} no longer exists; searching`);
+        logger.warn(`Mapped session ${existing.sessionID} no longer exists; creating a new one`);
         this.deps.sessionMap.delete(existing.sessionID);
         await this.deps.sessionMap.persist();
       }
     }
 
-    const found = await this.searchSessions(client, event);
-    if (found) {
-      this.recordResolved(found, repo, event);
-      return found.id;
-    }
-
-    logger.info(`No existing session for ${repo}; starting a new one`);
+    logger.info(`No session mapping for ${repo}#${event.prNumber || event.headRef}; creating a new session (agent can claim it via 'opencode-observer subscribe')`);
     const created = await client.createSession(buildSessionTitle(event));
     this.recordResolved(created, repo, event);
     return created.id;
-  }
-
-  // Heuristic fallback when the session map has no hit. Tries to find the
-  // originating opencode session by:
-  //   1. Matching the PR branch name against the session's worktree directory
-  //      via a /vcs query (the opencode server reports the branch checked out
-  //      in each worktree, so a session whose worktree is on the event's branch
-  //      is the originating session).
-  //   2. Matching the PR branch name's last segment against the session's
-  //      directory path (OpenChamber names worktrees after branches, e.g.
-  //      branch "feat/x" → worktree ".../feat-x" — close but not exact).
-  //   3. Matching the repo name or PR number against session titles.
-  //   4. Scanning message text for branch / PR / URL mentions.
-  // Prefers primary sessions (no parentID) over subagent sessions, and the
-  // most recently updated session wins.
-  //
-  // GUARD: a session already mapped to a different branch in the session map
-  // is NOT considered a match for the event's branch, even if its worktree's
-  // /vcs reports the event's branch. OpenChamber reuses worktrees across
-  // branches over time, so a /vcs match alone is unreliable — the session's
-  // content belongs to its original branch, not whatever the worktree is on
-  // now.
-  async searchSessions(client: OpencodeClient, event: ActionableEvent): Promise<Session | null> {
-    const sessions = await client.listSessions();
-    const repoName = event.repo.split("/")[1] ?? "";
-
-    // Build a set of sessionIDs already mapped to a DIFFERENT branch — those
-    // sessions should not match this event even if /vcs says their worktree
-    // is on event.headRef. OpenChamber reuses worktrees across branches.
-    const sessionsOnOtherBranch = new Set<string>();
-    for (const rec of this.deps.sessionMap.list()) {
-      if (rec.repo !== event.repo) continue;
-      if (rec.branch && rec.branch !== event.headRef) {
-        sessionsOnOtherBranch.add(rec.sessionID);
-      }
-    }
-
-    // Derive a worktree directory hint from the branch name. OpenCode worktree
-    // dirs are named after the branch's last path segment, e.g. branch
-    // "opencode/hidden-comet" → worktree dir ".../hidden-comet".
-    const branchHint = event.headRef ? event.headRef.split("/").pop() ?? "" : "";
-
-    // For each primary session, query the opencode server for the worktree's
-    // current branch. Sessions whose worktree is on the event's branch are
-    // exact matches. Cache the results per-client to avoid re-querying.
-    const branchByDir = new Map<string, string | null>();
-    const getBranchForDir = async (dir: string): Promise<string | null> => {
-      if (branchByDir.has(dir)) return branchByDir.get(dir) ?? null;
-      let branch: string | null = null;
-      try {
-        const vcs = await client.vcsInfoForDirectory(dir);
-        branch = vcs.branch ?? null;
-      } catch {
-        // VCS query failed (or no git in that dir) — leave null.
-      }
-      branchByDir.set(dir, branch);
-      return branch;
-    };
-
-    const score = async (s: Session): Promise<number> => {
-      // GUARD: skip sessions already mapped to a different branch. They belong
-      // to that branch's work, not this one — even if the worktree has since
-      // been reassigned to our branch.
-      if (sessionsOnOtherBranch.has(s.id)) return 0;
-
-      let score = 0;
-      // Primary sessions are strongly preferred over subagents.
-      if (!s.parentID) score += 1000;
-      // Exact branch match via /vcs query — strongest signal.
-      if (s.directory && event.headRef) {
-        const branch = await getBranchForDir(s.directory);
-        if (branch && branch === event.headRef) score += 2000;
-      }
-      // Directory match by branch hint is a weaker fallback.
-      if (branchHint && s.directory.includes(branchHint)) score += 500;
-      // Repo name in directory or title.
-      if (s.directory.includes(repoName)) score += 100;
-      if (s.title.includes(repoName) || s.title.includes(event.repo)) score += 100;
-      // PR number in title.
-      if (event.prNumber && (s.title.includes(`#${event.prNumber}`) || s.title.includes(String(event.prNumber)))) score += 200;
-      // Recency bonus (log scale, max ~50 for very recent).
-      const ageSec = (Date.now() - s.time.updated) / 1000;
-      score += Math.max(0, 50 - Math.log10(Math.max(1, ageSec)) * 10);
-      return score;
-    };
-
-    // Score all sessions (concurrently to avoid serial /vcs round-trips).
-    const scored = await Promise.all(sessions.map(async (s) => ({ s, score: await score(s) })));
-    const candidates = scored
-      .filter((c) => c.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, SEARCH_SESSION_LIMIT);
-
-    if (candidates.length === 0 || candidates[0].score < 100) {
-      // No strong directory/title match — fall back to message content search.
-      // Also exclude sessions on other branches from the message search.
-      const searchable = sessions.filter((s) => !sessionsOnOtherBranch.has(s.id));
-      return this.searchByMessages(client, searchable, event, repoName);
-    }
-
-    // VALIDATION: for any candidate with a strong score, verify the session
-    // is actually the originating session for this event. A worktree can be
-    // reassigned to a different branch while its session is about a totally
-    // unrelated topic — directory/repo-name matches are unsafe on their own.
-    //
-    // Relevance rules (a session is relevant if ANY is true):
-    //   1. Primary session (no parentID) AND its worktree's current branch
-    //      matches the event's headRef. This is the originating session —
-    //      its first user message may not mention the branch/PR because the
-    //      session predates the PR (e.g. "Please select a readme todo item
-    //      and implement" → became PR #1200 lunar-aardvark).
-    //   2. The session's first user message mentions the event's branch or
-    //      PR number. This catches sessions that were created in response to
-    //      the PR (e.g. CI failure events include the branch in the prompt).
-    //
-    // Walk the candidates in score order, returning the first that's
-    // relevant. If none are relevant, fall through to message search.
-    for (const candidate of candidates) {
-      if (candidate.score < 100) break;
-      const relevant = await this.isSessionRelevant(client, candidate.s, event);
-      if (relevant) return candidate.s;
-    }
-
-    // No scored candidate passed validation — fall back to message search.
-    // Also exclude sessions on other branches from the message search.
-    const searchable = sessions.filter((s) => !sessionsOnOtherBranch.has(s.id));
-    return this.searchByMessages(client, searchable, event, repoName);
-  }
-
-  // Returns true if the session is the originating session for this event.
-  // See the comment above searchSessions for the full relevance rules.
-  private async isSessionRelevant(
-    client: OpencodeClient,
-    session: Session,
-    event: ActionableEvent,
-  ): Promise<boolean> {
-    // Rule 1: primary session with worktree on the event's branch AND the
-    // session has been active recently (within 7 days). This is the
-    // originating session — its first user message may not mention the
-    // branch/PR because the session predates the PR (e.g. "Please select a
-    // readme todo item and implement" → became PR #1200 lunar-aardvark).
-    // The recency guard prevents matching stale sessions whose worktrees
-    // have been reassigned to unrelated branches (e.g. a 9-day-old "Home
-    // Assistant Ingress" session whose worktree got checked out to
-    // renovate/typescript-7.x — that session didn't create the typescript work).
-    if (!session.parentID && session.directory && event.headRef) {
-      const ageMs = Date.now() - session.time.updated;
-      const RECENT_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-      if (ageMs < RECENT_THRESHOLD_MS) {
-        try {
-          const vcs = await client.vcsInfoForDirectory(session.directory);
-          if (vcs.branch === event.headRef) return true;
-        } catch {
-          // VCS query failed — fall through to rule 2.
-        }
-      }
-    }
-    // Rule 2: first user message mentions the branch or PR.
-    return this.sessionRelevantToEvent(client, session.id, event);
-  }
-
-  // Returns true if the session's first user message mentions the event's
-  // branch, PR number, or htmlUrl — i.e. the session was originally about this
-  // event's subject. Used to reject /vcs branch matches on reassigned
-  // worktrees where the session's true topic is unrelated to the current
-  // branch.
-  private async sessionRelevantToEvent(
-    client: OpencodeClient,
-    sessionID: string,
-    event: ActionableEvent,
-  ): Promise<boolean> {
-    const needles: string[] = [];
-    if (event.headRef) needles.push(event.headRef);
-    if (event.prNumber) needles.push(`#${event.prNumber}`, `pull/${event.prNumber}`);
-    if (event.htmlUrl) needles.push(event.htmlUrl);
-    if (needles.length === 0) return true; // can't validate — don't reject
-    try {
-      const messages = await client.messages(sessionID);
-      const firstUserMsg = messages.find((m) => m.info.role === "user");
-      if (!firstUserMsg) return true; // no user message — can't validate, don't reject
-      return firstUserMsg.parts.some(
-        (p) => p.type === "text" && needles.some((n) => (p as { text?: string }).text?.includes(n)),
-      );
-    } catch {
-      return true; // can't read messages — don't reject
-    }
-  }
-
-  private async searchByMessages(
-    client: OpencodeClient,
-    sessions: Session[],
-    event: ActionableEvent,
-    repoName: string,
-  ): Promise<Session | null> {
-    const needles: string[] = [];
-    if (event.headRef) needles.push(event.headRef);
-    if (event.prNumber) needles.push(`#${event.prNumber}`, `pull/${event.prNumber}`);
-    if (event.htmlUrl) needles.push(event.htmlUrl);
-    if (needles.length === 0) return null;
-
-    // Only search primary sessions (no parentID), most recent first.
-    const candidates = sessions
-      .filter((s) => !s.parentID)
-      .sort((a, b) => b.time.updated - a.time.updated)
-      .slice(0, SEARCH_SESSION_LIMIT);
-
-    // Fetch messages for all candidates in parallel. For 12+ sessions with
-    // hundreds of messages each, this is a huge win over the sequential
-    // loop (20 sequential round-trips → 1 parallel batch).
-    const results = await Promise.all(
-      candidates.map(async (session) => {
-        try {
-          const messages = await client.messages(session.id);
-          // Only search the FIRST user message — the session's original topic.
-          // Searching all messages catches polluted sessions that were
-          // previously (wrongly) prompted about a different branch — their
-          // later messages contain the wrong branch's needles, but their
-          // first user message reflects the session's true topic.
-          const firstUserMsg = messages.find((m) => m.info.role === "user");
-          if (!firstUserMsg) return { session, hit: false };
-          const hit = firstUserMsg.parts.some(
-            (p) => p.type === "text" && needles.some((n) => (p as { text?: string }).text?.includes(n)),
-          );
-          return { session, hit };
-        } catch {
-          return { session, hit: false };
-        }
-      }),
-    );
-
-    // Return the first candidate (most recently updated) that has a needle
-    // in its first user message.
-    for (const { session, hit } of results) {
-      if (hit) return session;
-    }
-    return null;
   }
 
   private recordResolved(session: Session, repo: string, event: ActionableEvent): void {

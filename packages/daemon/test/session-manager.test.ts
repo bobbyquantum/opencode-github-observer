@@ -16,7 +16,6 @@ type MockClient = {
   promptAsync: ReturnType<typeof vi.fn>;
   listSessions: ReturnType<typeof vi.fn>;
   messages: ReturnType<typeof vi.fn>;
-  vcsInfoForDirectory?: ReturnType<typeof vi.fn>;
 };
 
 function makeSession(id: string, dir = "/r/repo"): Session {
@@ -83,26 +82,7 @@ describe("SessionManager", () => {
     });
   });
 
-  it("falls back to searching sessions when the map misses", async () => {
-    const client: MockClient = {
-      getSession: vi.fn(),
-      createSession: vi.fn(),
-      promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => [makeSession("s-found", "/r/repo")]),
-      messages: vi.fn(async () => [
-        { info: { id: "m", sessionID: "s-found", role: "user", time: { created: 1 } }, parts: [{ id: "p", sessionID: "s-found", messageID: "m", type: "text", text: "working on feature branch" }] },
-      ] as Message[]),
-    };
-    const manager = makeManager(client, sessionMap);
-
-    await manager.handleEvent(makeEvent({ headRef: "feature" }));
-
-    expect(client.listSessions).toHaveBeenCalled();
-    expect(client.promptAsync).toHaveBeenCalledWith("s-found", expect.anything());
-    expect(sessionMap.lookup("owner/repo", { branch: "feature" })?.sessionID).toBe("s-found");
-  });
-
-  it("creates a new session when nothing matches", async () => {
+  it("creates a new session when the map has no entry", async () => {
     const client: MockClient = {
       getSession: vi.fn(),
       createSession: vi.fn(async () => makeSession("s-new")),
@@ -478,114 +458,6 @@ describe("SessionManager", () => {
     const outcome = await manager.repromptForMergeConflict("owner/repo", 42, "feat", "abc", "main", 30 * 60 * 1000);
     expect(outcome).toBe("skipped:no-session");
     expect(sessionMap.getBySession("s1")).toBeUndefined();
-  });
-
-  it("does not match a session already mapped to a different branch even if /vcs reports the event branch", async () => {
-    // ses_existing is mapped to branch "feat-a" in the session map.
-    sessionMap.record({ sessionID: "ses_existing", repo: "owner/repo", prNumber: 100, branch: "feat-a", headSha: "sha-a", updatedAt: "t" });
-    // But the opencode server reports its worktree is now on "feat-b".
-    const client: MockClient = {
-      getSession: vi.fn(),
-      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
-      promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => [
-        { ...makeSession("ses_existing", "/r/repo"), title: "feat-a work" },
-      ]),
-      messages: vi.fn(),
-      vcsInfoForDirectory: vi.fn(async () => ({ branch: "feat-b", default_branch: "main" })),
-    };
-    const manager = makeManager(client, sessionMap);
-
-    // Event for "feat-b" — should NOT reuse ses_existing.
-    await manager.handleEvent(makeEvent({ headRef: "feat-b", prNumber: 200, headSha: "sha-b" }));
-
-    // ses_existing should NOT have been prompted.
-    expect(client.promptAsync).not.toHaveBeenCalledWith("ses_existing", expect.anything());
-    // A new session should have been created instead.
-    expect(client.createSession).toHaveBeenCalled();
-  });
-
-  it("rejects a /vcs branch match when the session's first user message is unrelated to the event", async () => {
-    // ses_unrelated is on a worktree currently checked out to "feat-b" (/vcs
-    // match) but its first user message is about a totally different topic.
-    // The daemon should not match it to a feat-b CI failure.
-    const client: MockClient = {
-      getSession: vi.fn(),
-      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
-      promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => [
-        { ...makeSession("ses_unrelated", "/r/repo"), title: "unrelated topic" },
-      ]),
-      messages: vi.fn(async () => [
-        { info: { id: "m1", sessionID: "ses_unrelated", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_unrelated", messageID: "m1", type: "text", text: "Please research home assistant ingress and figure out what we could do" }] },
-      ]),
-      vcsInfoForDirectory: vi.fn(async () => ({ branch: "feat-b", default_branch: "main" })),
-    };
-    const manager = makeManager(client, sessionMap);
-
-    await manager.handleEvent(makeEvent({ headRef: "feat-b", prNumber: 200, headSha: "sha-b" }));
-
-    // ses_unrelated should NOT have been prompted — its first user message
-    // doesn't mention "feat-b" or "#200" AND it's not recently active (the
-    // test session has time.updated=1, which is epoch — well over 7 days old).
-    expect(client.promptAsync).not.toHaveBeenCalledWith("ses_unrelated", expect.anything());
-    // A new session should have been created.
-    expect(client.createSession).toHaveBeenCalled();
-  });
-
-  it("matches a primary session via /vcs branch match when it's recently active, even if its first user message doesn't mention the branch", async () => {
-    // This is the "README todo implementation" case: a primary session that
-    // created the work (e.g. "Please select a readme todo item") which later
-    // became a PR. Its first message doesn't mention the branch/PR, but it's
-    // the originating session because its worktree is on the event's branch
-    // and it's been active recently.
-    const recentMs = Date.now();
-    const client: MockClient = {
-      getSession: vi.fn(),
-      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
-      promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => [
-        // Primary session, recently updated, first message doesn't mention the branch.
-        { ...makeSession("ses_readme_todo", "/r/repo"), title: "README todo implementation", time: { created: 1, updated: recentMs } },
-      ]),
-      messages: vi.fn(async () => [
-        { info: { id: "m1", sessionID: "ses_readme_todo", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_readme_todo", messageID: "m1", type: "text", text: "Please select a readme todo item and implement" }] },
-      ]),
-      vcsInfoForDirectory: vi.fn(async () => ({ branch: "lunar-aardvark", default_branch: "main" })),
-    };
-    const manager = makeManager(client, sessionMap);
-
-    await manager.handleEvent(makeEvent({ headRef: "lunar-aardvark", prNumber: 1200, headSha: "sha-1200" }));
-
-    // ses_readme_todo SHOULD have been prompted — it's the originating session.
-    expect(client.promptAsync).toHaveBeenCalledWith("ses_readme_todo", expect.anything());
-    expect(client.createSession).not.toHaveBeenCalled();
-  });
-
-  it("does not match a primary session via /vcs when it's been idle for > 7 days (stale worktree reassignment)", async () => {
-    // Same as above but the session hasn't been updated in 9 days — the
-    // worktree has been reassigned to a different branch and the session is
-    // stale for this branch.
-    const nineDaysAgo = Date.now() - 9 * 24 * 60 * 60 * 1000;
-    const client: MockClient = {
-      getSession: vi.fn(),
-      createSession: vi.fn(async () => makeSession("s-new", "/r/repo")),
-      promptAsync: vi.fn(async () => {}),
-      listSessions: vi.fn(async () => [
-        { ...makeSession("ses_ha_ingress", "/r/repo"), title: "Home Assistant Ingress", time: { created: 1, updated: nineDaysAgo } },
-      ]),
-      messages: vi.fn(async () => [
-        { info: { id: "m1", sessionID: "ses_ha_ingress", role: "user" as const, time: { created: 1 } }, parts: [{ id: "p1", sessionID: "ses_ha_ingress", messageID: "m1", type: "text", text: "Please research home assistant ingress" }] },
-      ]),
-      vcsInfoForDirectory: vi.fn(async () => ({ branch: "renovate/typescript-7.x", default_branch: "main" })),
-    };
-    const manager = makeManager(client, sessionMap);
-
-    await manager.handleEvent(makeEvent({ headRef: "renovate/typescript-7.x", prNumber: 1194, headSha: "sha-ts" }));
-
-    // ses_ha_ingress should NOT have been prompted — it's stale (idle > 7 days).
-    expect(client.promptAsync).not.toHaveBeenCalledWith("ses_ha_ingress", expect.anything());
-    expect(client.createSession).toHaveBeenCalled();
   });
 
 });
