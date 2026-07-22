@@ -27,6 +27,7 @@ export type Session = {
     created: number;
     updated: number;
     compacting?: number;
+    archived?: number;
   };
 };
 

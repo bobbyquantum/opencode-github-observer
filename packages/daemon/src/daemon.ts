@@ -168,6 +168,12 @@ export class Daemon {
   private startWatchdog(config: WatchdogConfig, token: string): void {
     const run = async () => {
       if (!this.sessions || !this.branchPrCache || !token) return;
+
+      // Proactive cleanup: remove session map entries whose sessions no longer
+      // exist (deleted/archived in OpenChamber). Without this, stale entries
+      // accumulate forever if no events arrive for their PRs.
+      await this.cleanupStaleMappings();
+
       for (const [repo, _repoConfig] of Object.entries(this.config?.repos ?? {})) {
         try {
           const result = await findFailingPrs(repo, token, this.branchPrCache!, config);
@@ -223,6 +229,41 @@ export class Daemon {
     // Run once after a short delay (so the daemon settles first), then hourly.
     setTimeout(run, 30_000);
     this.watchdogTimer = setInterval(run, WATCHDOG_INTERVAL_MS);
+  }
+
+  // Removes session map entries whose sessions no longer exist in the opencode
+  // server (deleted or archived in OpenChamber). Runs on every watchdog tick
+  // so stale entries don't accumulate when no events arrive for their PRs.
+  private async cleanupStaleMappings(): Promise<void> {
+    if (!this.sessionMap || !this.serverManager || !this.config) return;
+    const entries = this.sessionMap.list();
+    if (entries.length === 0) return;
+
+    let removed = 0;
+    for (const entry of entries) {
+      const repoConfig = this.config.repos[entry.repo];
+      if (!repoConfig) continue;
+      try {
+        const server = await this.serverManager.ensure(repoConfig.workdir, repoConfig.serverUrl, repoConfig.serverPassword);
+        const session = await server.client.getSession(entry.sessionID);
+        // Also remove mappings for archived sessions — the agent is no longer
+        // working on them, so routing events there is pointless.
+        if (session.time?.archived) {
+          this.sessionMap.delete(entry.sessionID);
+          removed++;
+          logger.info(`watchdog: removed mapping for ${entry.repo}#${entry.prNumber ?? entry.branch} (session ${entry.sessionID} is archived)`);
+        }
+      } catch {
+        // Session is gone (deleted). Remove the stale mapping.
+        this.sessionMap.delete(entry.sessionID);
+        removed++;
+        logger.info(`watchdog: removed stale mapping for ${entry.repo}#${entry.prNumber ?? entry.branch} (session ${entry.sessionID} no longer exists)`);
+      }
+    }
+    if (removed > 0) {
+      await this.sessionMap.persist();
+      logger.info(`watchdog: cleaned up ${removed} stale session mapping(s)`);
+    }
   }
 
   async stop(): Promise<void> {
