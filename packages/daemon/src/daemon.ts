@@ -77,6 +77,7 @@ export class Daemon {
       sessionMap: this.sessionMap,
       ...(this.branchPrCache ? { branchPrCache: this.branchPrCache } : {}),
       ...(token ? { githubToken: token } : {}),
+      ...(config.promptInstructions ? { promptInstructions: config.promptInstructions } : {}),
     });
 
     // Start periodic stall detection. Scans opencode sessions for bash tools

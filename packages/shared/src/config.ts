@@ -14,6 +14,11 @@ export type ObserverConfig = {
   keepaliveIntervalMs: number;
   opencodeCommand: string;
   repos: Record<string, RepoConfig>;
+  // Instructions appended to every prompt the daemon sends to an agent.
+  // Tells the agent what its goal is when handling CI failures, review
+  // comments, and merge conflicts. Configurable via:
+  //   opencode-observer config set promptInstructions "..."
+  promptInstructions: string;
 };
 
 export const DEFAULT_CONFIG: ObserverConfig = {
@@ -26,6 +31,14 @@ export const DEFAULT_CONFIG: ObserverConfig = {
   keepaliveIntervalMs: 30000,
   opencodeCommand: "opencode",
   repos: {},
+  promptInstructions: [
+    "Your goal is to fully resolve every issue raised in this event.",
+    "- Address every review comment individually. Do not skip any.",
+    "- Fix every CI failure. Check the logs, identify the root cause, and push a fix.",
+    "- Fix any bad code, small issues, or flagged issues mentioned in the event.",
+    "- Do not stop until all issues are resolved and CI passes.",
+    "- Push your changes to the branch when done.",
+  ].join("\n"),
 };
 
 export type DeviceFlowResponse = {
@@ -101,6 +114,13 @@ export function validateConfig(value: unknown): ObserverConfig {
       throw new Error("opencodeCommand must be a non-empty string");
     }
     config.opencodeCommand = obj.opencodeCommand;
+  }
+
+  if (obj.promptInstructions !== undefined) {
+    if (typeof obj.promptInstructions !== "string") {
+      throw new Error("promptInstructions must be a string");
+    }
+    config.promptInstructions = obj.promptInstructions;
   }
 
   if (obj.repos !== undefined) {

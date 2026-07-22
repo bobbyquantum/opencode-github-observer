@@ -26,6 +26,9 @@ export type SessionManagerDeps = {
   branchPrCache?: BranchPrCache;
   githubToken?: string;
   cooldownMs?: number;
+  // Instructions appended to every prompt. Configurable via
+  // `opencode-observer config set promptInstructions "..."`.
+  promptInstructions?: string;
 };
 
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
@@ -117,7 +120,7 @@ export class SessionManager {
     // Record cooldown so near-duplicate events within the window are skipped.
     if (cooldownKey) this.setCooldown(cooldownKey);
 
-    const prompt = buildPrompt(enriched);
+    const prompt = buildPrompt(enriched, this.deps.promptInstructions);
     try {
       info.status = "fixing";
       await client.promptAsync(sessionID, { parts: [{ type: "text", text: prompt }] });
@@ -320,7 +323,7 @@ export class SessionManager {
       return "skipped:cooldown";
     }
 
-    const prompt = buildPrompt(event);
+    const prompt = buildPrompt(event, this.deps.promptInstructions);
     try {
       if (cooldownKey) this.setCooldown(cooldownKey);
       await client.promptAsync(mapped.sessionID, { parts: [{ type: "text", text: prompt }] });
@@ -387,7 +390,7 @@ export class SessionManager {
       return "skipped:cooldown";
     }
 
-    const prompt = [
+    const lines = [
       `Merge conflict detected on ${repo}#${prNumber}.`,
       ``,
       `Branch "${branch}" has conflicts with the base branch "${baseRef}" and cannot be merged cleanly.`,
@@ -395,7 +398,12 @@ export class SessionManager {
       `URL: https://github.com/${repo}/pull/${prNumber}`,
       ``,
       `Rebase your branch on "${baseRef}" and resolve the conflicts, then push the updated branch. If the conflicts are non-trivial (e.g. the branch has diverged significantly), consider merging "${baseRef}" into "${branch}" and resolving in your worktree rather than abandoning the PR. After resolving, verify CI passes before requesting review.`,
-    ].join("\n");
+    ];
+    if (this.deps.promptInstructions) {
+      lines.push(``);
+      lines.push(this.deps.promptInstructions);
+    }
+    const prompt = lines.join("\n");
 
     try {
       this.setCooldown(cooldownKey);
@@ -409,7 +417,7 @@ export class SessionManager {
   }
 }
 
-export function buildPrompt(event: ActionableEvent): string {
+export function buildPrompt(event: ActionableEvent, instructions?: string): string {
   const lines = [
     `A new event needs your attention on ${event.repoFullName}.`,
     ``,
@@ -432,6 +440,10 @@ export function buildPrompt(event: ActionableEvent): string {
       ? `Investigate this and push a fix to the branch "${event.headRef}".`
       : `Investigate this and push a fix.`,
   );
+  if (instructions) {
+    lines.push(``);
+    lines.push(instructions);
+  }
   return lines.join("\n");
 }
 
