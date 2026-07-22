@@ -251,6 +251,34 @@ export class SessionManager {
     void this.deps.sessionMap.persist();
   }
 
+  // Extracts incomplete todos from a session's message history. Looks for the
+  // last `todowrite` tool call and returns any items with status "in_progress"
+  // or "pending". Used by the watchdog to remind agents of unfinished work.
+  private async getIncompleteTodos(
+    client: OpencodeClient,
+    sessionID: string,
+  ): Promise<Array<{ status: string; content: string }>> {
+    try {
+      const messages = await client.messages(sessionID);
+      // Walk messages in reverse to find the LAST todowrite tool call.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        for (const part of msg.parts) {
+          if (part.type !== "tool") continue;
+          const toolPart = part as { tool: string; state?: { status: string; input?: { todos?: Array<{ status: string; content: string }> } } };
+          if (toolPart.tool !== "todowrite") continue;
+          const todos = toolPart.state?.input?.todos;
+          if (!Array.isArray(todos)) continue;
+          // Return only incomplete items.
+          return todos.filter((t) => t.status === "in_progress" || t.status === "pending");
+        }
+      }
+    } catch {
+      // Can't read messages — no todos to report.
+    }
+    return [];
+  }
+
   async shutdown(): Promise<void> {
     this.sessions.clear();
     this.cooldowns.clear();
@@ -302,6 +330,10 @@ export class SessionManager {
       return "skipped:idle";
     }
 
+    // Check if the session left incomplete todos — if so, include them in the
+    // re-prompt so the agent knows exactly what it left unfinished.
+    const incompleteTodos = await this.getIncompleteTodos(client, mapped.sessionID);
+
     // Build the event and check cooldown before prompting.
     const event: ActionableEvent = {
       type: "ci_failure",
@@ -312,7 +344,9 @@ export class SessionManager {
       headSha,
       headRef: branch,
       baseRef: "",
-      message: `CI checks still failing (watchdog): ${failNames.join(", ")}`,
+      message: incompleteTodos.length > 0
+        ? `CI checks still failing (watchdog): ${failNames.join(", ")}\n\nYou also left ${incompleteTodos.length} task(s) unfinished:\n${incompleteTodos.map((t: { status: string; content: string }) => `- [${t.status}] ${t.content}`).join("\n")}`
+        : `CI checks still failing (watchdog): ${failNames.join(", ")}`,
       htmlUrl: `https://github.com/${repo}/pull/${prNumber}/checks`,
       sender: "watchdog",
       timestamp: new Date().toISOString(),
