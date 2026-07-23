@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, statSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
 import { WebSocketClient } from "./ws-client.js";
 import { SessionManager } from "./session-manager.js";
 import { SessionMap } from "./session-map.js";
@@ -56,6 +58,12 @@ export class Daemon {
 
     // Ensures an opencode server is running per watched repo working directory.
     this.serverManager = new OpencodeServerManager(config.opencodeCommand);
+
+    // Auto-symlink opencode.json into worktrees so they inherit the observer
+    // MCP server config. OpenChamber creates worktrees without opencode.json,
+    // and worktree sessions are project-scoped (they don't read the global
+    // config for MCP servers).
+    this.symlinkWorktreeConfigs(config.repos);
 
     // Start watching opencode event streams to learn which session originated
     // each branch/PR. One watcher per configured repo.
@@ -264,6 +272,45 @@ export class Daemon {
     if (removed > 0) {
       await this.sessionMap.persist();
       logger.info(`watchdog: cleaned up ${removed} stale session mapping(s)`);
+    }
+  }
+
+  // Auto-symlinks opencode.json from the repo's workdir into each worktree
+  // so worktree sessions inherit the observer MCP server config. OpenChamber
+  // creates worktrees without opencode.json, and worktree sessions are
+  // project-scoped (they don't read the global config for MCP servers).
+  private symlinkWorktreeConfigs(repos: Record<string, { workdir: string }>): void {
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+    const worktreeBase = join(home, ".local", "share", "opencode", "worktree");
+    if (!existsSync(worktreeBase)) return;
+
+    for (const [_repo, repoConfig] of Object.entries(repos)) {
+      const sourceConfig = join(repoConfig.workdir, "opencode.json");
+      if (!existsSync(sourceConfig)) continue;
+
+      // Scan worktree subdirectories (each project has a hash dir with
+      // worktree dirs inside).
+      try {
+        for (const projectDir of readdirSync(worktreeBase)) {
+          const projectPath = join(worktreeBase, projectDir);
+          if (!statSync(projectPath).isDirectory()) continue;
+          for (const wtName of readdirSync(projectPath)) {
+            const wtPath = join(projectPath, wtName);
+            if (!statSync(wtPath).isDirectory()) continue;
+            const targetConfig = join(wtPath, "opencode.json");
+            if (!existsSync(targetConfig)) {
+              try {
+                symlinkSync(sourceConfig, targetConfig);
+                logger.info(`Symlinked opencode.json into worktree ${wtName}`);
+              } catch {
+                // Might already exist or permission issue — skip.
+              }
+            }
+          }
+        }
+      } catch {
+        // Worktree dir doesn't exist or can't be read — skip.
+      }
     }
   }
 
