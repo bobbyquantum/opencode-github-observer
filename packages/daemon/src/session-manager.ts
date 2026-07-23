@@ -94,11 +94,17 @@ export class SessionManager {
       return;
     }
 
-    let sessionID: string;
+    let sessionID: string | null;
     try {
       sessionID = await this.resolveSessionID(client, enriched);
     } catch (err) {
       logger.error(`Could not resolve session for ${event.repo}`, err);
+      return;
+    }
+
+    // No session linked for this PR — skip the event. The agent must run
+    // /link-pr to subscribe its session before events get routed.
+    if (!sessionID) {
       return;
     }
 
@@ -207,13 +213,13 @@ export class SessionManager {
 
   // Resolves the session for an event. The session map is the sole source of
   // truth — agents explicitly subscribe their session to a PR via
-  // `opencode-observer subscribe`. No guessing, no heuristics.
+  // `opencode-observer subscribe` (or the /link-pr command).
   //
   // 1. Look up the session map by branch / headSha / prNumber.
   // 2. If found and the session still exists, use it.
-  // 3. If not found, create a new session (the agent can subscribe later to
-  //    claim it, or the mapping stays as-is for future events on this branch).
-  async resolveSessionID(client: OpencodeClient, event: ActionableEvent): Promise<string> {
+  // 3. If not found, return null — the event is skipped. No new session is
+  //    created. The agent must link its session first via /link-pr.
+  async resolveSessionID(client: OpencodeClient, event: ActionableEvent): Promise<string | null> {
     const repo = event.repo;
     const existing = this.deps.sessionMap.lookup(repo, {
       ...(event.headRef ? { branch: event.headRef } : {}),
@@ -227,16 +233,14 @@ export class SessionManager {
         this.recordResolved(session, repo, event);
         return session.id;
       } catch {
-        logger.warn(`Mapped session ${existing.sessionID} no longer exists; creating a new one`);
+        logger.warn(`Mapped session ${existing.sessionID} no longer exists; removing mapping`);
         this.deps.sessionMap.delete(existing.sessionID);
         await this.deps.sessionMap.persist();
       }
     }
 
-    logger.info(`No session mapping for ${repo}#${event.prNumber || event.headRef}; creating a new session (agent can claim it via 'opencode-observer subscribe')`);
-    const created = await client.createSession(buildSessionTitle(event));
-    this.recordResolved(created, repo, event);
-    return created.id;
+    logger.info(`No session linked for ${repo}#${event.prNumber || event.headRef}; skipping event (agent must run /link-pr first)`);
+    return null;
   }
 
   private recordResolved(session: Session, repo: string, event: ActionableEvent): void {

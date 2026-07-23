@@ -82,7 +82,7 @@ describe("SessionManager", () => {
     });
   });
 
-  it("creates a new session when the map has no entry", async () => {
+  it("skips the event when the map has no entry (no session linked)", async () => {
     const client: MockClient = {
       getSession: vi.fn(),
       createSession: vi.fn(async () => makeSession("s-new")),
@@ -94,12 +94,12 @@ describe("SessionManager", () => {
 
     await manager.handleEvent(makeEvent());
 
-    expect(client.createSession).toHaveBeenCalled();
-    expect(client.promptAsync).toHaveBeenCalledWith("s-new", expect.anything());
-    expect(sessionMap.lookup("owner/repo", { branch: "feature" })?.sessionID).toBe("s-new");
+    // No session linked — event is skipped, no new session created.
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.promptAsync).not.toHaveBeenCalled();
   });
 
-  it("creates a new session when the mapped one no longer exists", async () => {
+  it("skips the event and removes the mapping when the mapped session no longer exists", async () => {
     sessionMap.record({ sessionID: "s-gone", repo: "owner/repo", branch: "feature", updatedAt: "t" });
     const client: MockClient = {
       getSession: vi.fn(async () => {
@@ -114,8 +114,9 @@ describe("SessionManager", () => {
 
     await manager.handleEvent(makeEvent());
 
-    expect(client.createSession).toHaveBeenCalled();
-    expect(sessionMap.lookup("owner/repo", { branch: "feature" })?.sessionID).toBe("s-new");
+    // Stale mapping removed, no new session created, event skipped.
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(client.promptAsync).not.toHaveBeenCalled();
     expect(sessionMap.getBySession("s-gone")).toBeUndefined();
   });
 
