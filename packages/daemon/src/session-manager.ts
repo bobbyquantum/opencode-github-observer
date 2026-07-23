@@ -221,6 +221,9 @@ export class SessionManager {
   //    created. The agent must link its session first via /link-pr.
   async resolveSessionID(client: OpencodeClient, event: ActionableEvent): Promise<string | null> {
     const repo = event.repo;
+    // Reload the session map from disk in case the MCP server's link_pr tool
+    // wrote a new mapping since the last load.
+    await this.deps.sessionMap.reloadIfStale();
     const existing = this.deps.sessionMap.lookup(repo, {
       ...(event.headRef ? { branch: event.headRef } : {}),
       ...(event.headSha ? { headSha: event.headSha } : {}),
