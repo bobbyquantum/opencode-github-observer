@@ -103,8 +103,8 @@ export function validateConfig(value: unknown): ObserverConfig {
   }
 
   if (obj.keepaliveIntervalMs !== undefined) {
-    if (typeof obj.keepaliveIntervalMs !== "number" || !Number.isInteger(obj.keepaliveIntervalMs) || obj.keepaliveIntervalMs <= 0) {
-      throw new Error("keepaliveIntervalMs must be a positive integer");
+    if (typeof obj.keepaliveIntervalMs !== "number" || !Number.isInteger(obj.keepaliveIntervalMs) || obj.keepaliveIntervalMs < 0) {
+      throw new Error("keepaliveIntervalMs must be a non-negative integer (0 disables it)");
     }
     config.keepaliveIntervalMs = obj.keepaliveIntervalMs;
   }

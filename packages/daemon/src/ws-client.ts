@@ -147,6 +147,13 @@ export class WebSocketClient extends EventEmitter {
 
   private startKeepalive(): void {
     this.clearKeepalive();
+    // Only start keepalive if interval is positive (0 = disabled).
+    // Cloudflare's Hibernation WebSocket API keeps connections alive without
+    // client-side pings. The DO's setWebSocketAutoResponse handles any
+    // edge-level health checks without waking the DO. Sending our own pings
+    // is redundant and can cause unnecessary DO reads if the auto-response
+    // has any edge cases.
+    if (this.keepaliveIntervalMs <= 0) return;
     this.keepaliveTimer = setInterval(() => {
       this.send({ kind: "ping" });
     }, this.keepaliveIntervalMs);
