@@ -12,8 +12,8 @@ import { loadConfig, loadToken } from "./config.js";
 import { logger, setLogLevel } from "./logger.js";
 import type { ServerMessage } from "@opencode-observer/shared";
 
-const STALL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
-const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000; // every hour
+const STALL_CHECK_INTERVAL_MS = 15 * 60 * 1000; // every 5 minutes
+const WATCHDOG_INTERVAL_MS = 4 * 60 * 60 * 1000; // every hour
 
 export class Daemon {
   private client: WebSocketClient | null = null;
